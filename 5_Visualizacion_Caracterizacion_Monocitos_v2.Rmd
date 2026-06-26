@@ -1,0 +1,1099 @@
+---
+title: "Visualización y Caracterización — Subpoblaciones de Monocitos"
+subtitle: "Muestras: C1_B3, C2_B8, HI1_B1, HI3_B2, HI4_B4, HI8_B5, HI9_B6"
+author: "Celia Galiano Manzanares"
+date: '`r format(Sys.Date(), "%d de %B de %Y")`'
+output:
+  html_document:
+    theme: united
+    df_print: kable
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy      = TRUE,
+  tidy.opts = list(width.cutoff = 95),
+  message   = FALSE,
+  warning   = FALSE,
+  error     = TRUE
+)
+```
+
+> **Nota de uso:** Este script parte del objeto `seu_mono_integrado.rds` generado en el script de reclustering (script 4). No realiza ningún procesamiento — solo visualización y caracterización. Una vez inspeccionados los dotplots y FeaturePlots, rellenar el vector `cluster_order` con los nombres de identidad asignados a cada cluster para etiquetar el UMAP final.
+
+---
+
+# Setup y parámetros
+
+```{r libraries}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(scales)
+library(tidyr)
+```
+
+```{r init}
+# ── RUTAS ──────────────────────────────────────────────────────────────────────
+ruta_base     <- "C:/Users/celia/Escritorio/TFM/workspace/"
+ruta_rds_mono <- paste0(ruta_base, "seu_monocitos_integrado.rds")
+ruta_out      <- paste0(ruta_base, "output/")
+ruta_imagenes <- paste0(ruta_out,  "imagenes_caracterizacion_mo/")
+
+for (d in c(ruta_out, ruta_imagenes)) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+}
+
+# ── PALETA DE COLORES ──────────────────────────────────────────────────────────
+colores_mieloides <- c(
+  "Classical monocytes"          = "#e34459",
+  "Intermediate monocytes"       = "#f4a261",
+  "Non classical monocytes"      = "#4e79a7",
+  "Myeloid dendritic cells"      = "#9467bd",
+  "Plasmacytoid dendritic cells" = "#8c564b",
+  "Progenitor cells"             = "#bcbd22",
+  "Macrophages"                  = "#2ca02c",
+  "Microglia"                    = "#ff7f0e",
+  "Low-density neutrophils"      = "#7f7f7f",
+  "Low-density basophils"        = "#c7c7c7"
+)
+
+# ── GRUPOS ─────────────────────────────────────────────────────────────────────
+grupo_map <- c(
+  C1_B3  = "Control", C2_B8  = "Control",
+  HI1_B1 = "HI",      HI3_B2 = "HI",
+  HI4_B4 = "HI",      HI8_B5 = "HI",
+  HI9_B6 = "HI"
+)
+
+cat("Rutas configuradas\n")
+cat("  RDS entrada:  ", ruta_rds_mono, "\n")
+cat("  Imágenes:     ", ruta_imagenes, "\n")
+```
+
+---
+
+# Carga del objeto
+
+```{r load}
+if (!file.exists(ruta_rds_mono)) {
+  stop("Archivo no encontrado: ", ruta_rds_mono)
+}
+
+seu_mono <- readRDS(ruta_rds_mono)
+
+# Asegurar metadato de grupo
+if (!"grupo" %in% colnames(seu_mono@meta.data)) {
+  seu_mono@meta.data$grupo <- unname(grupo_map[seu_mono@meta.data$orig.ident])
+}
+
+cat("── Resumen ─────────────────────────────────────────────────\n")
+cat("Células:   ", ncol(seu_mono), "\n")
+cat("Genes:     ", nrow(seu_mono), "\n")
+cat("Muestras:  ", paste(unique(seu_mono$orig.ident), collapse = ", "), "\n")
+cat("Clusters:  ", length(unique(seu_mono$seurat_clusters)), "\n")
+cat("Columnas SingleR disponibles:\n")
+print(grep("SingleR", colnames(seu_mono@meta.data), value = TRUE))
+cat("────────────────────────────────────────────────────────────\n")
+```
+
+---
+
+# UMAPs de contexto
+
+## Por cluster, muestra y condición
+
+```{r umap_contexto, fig.height=8, fig.width=18}
+p_clusters <- DimPlot(seu_mono, reduction = "umap", group.by = "seurat_clusters",
+                      label = TRUE, label.size = 5) +
+  ggtitle("Clusters (Seurat)") +
+  theme(legend.position = "none")
+
+p_muestra <- DimPlot(seu_mono, reduction = "umap", group.by = "orig.ident") +
+  ggtitle("Muestra") +
+  theme(legend.position = "right")
+
+p_grupo <- DimPlot(seu_mono, reduction = "umap", group.by = "grupo",
+                   cols = c("Control" = "#4e79a7", "HI" = "#e34459")) +
+  ggtitle("Condición") +
+  theme(legend.position = "right")
+
+p_clusters | p_muestra | p_grupo
+
+ggsave(paste0(ruta_imagenes, "UMAP_contexto_3paneles.jpg"),
+       plot = p_clusters | p_muestra | p_grupo,
+       width = 18, height = 6, dpi = 300, bg = "white")
+```
+
+## Anotación automática SingleR
+
+```{r umap_singler, fig.height=10, fig.width=10}
+p_singler_fine <- DimPlot(seu_mono, reduction = "umap", group.by = "SingleR.Mono.Fine",
+                           label = TRUE, label.size = 3.5, repel = TRUE) +
+  ggtitle("Anotación SingleR Monaco (label.fine)") +
+  theme(plot.title      = element_text(hjust = 0.5, size = 13),
+        legend.position = "bottom",
+        legend.text     = element_text(size = 9)) +
+  guides(color = guide_legend(ncol = 3, override.aes = list(size = 3)))
+
+p_singler_main <- DimPlot(seu_mono, reduction = "umap", group.by = "SingleR.Mono.Main",
+                           label = TRUE, label.size = 3.5, repel = TRUE) +
+  ggtitle("Anotación SingleR Monaco (label.main)") +
+  theme(plot.title      = element_text(hjust = 0.5, size = 13),
+        legend.position = "bottom",
+        legend.text     = element_text(size = 9)) +
+  guides(color = guide_legend(ncol = 3, override.aes = list(size = 3)))
+
+print(p_singler_fine)
+print(p_singler_main)
+
+ggsave(paste0(ruta_imagenes, "UMAP_SingleR_Fine.jpg"),  plot = p_singler_fine,
+       width = 10, height = 10, dpi = 300, bg = "white")
+ggsave(paste0(ruta_imagenes, "UMAP_SingleR_Main.jpg"),  plot = p_singler_main,
+       width = 10, height = 10, dpi = 300, bg = "white")
+```
+
+## Highlight por muestra individual
+
+```{r umap_highlight, fig.height=7, fig.width=8}
+lista_muestras <- unique(seu_mono$orig.ident)
+
+for (muestra in lista_muestras) {
+  celulas_muestra <- WhichCells(seu_mono, expression = orig.ident == muestra)
+
+  p_highlight <- DimPlot(seu_mono, reduction = "umap",
+                          cells.highlight = celulas_muestra,
+                          cols.highlight  = "#e34459",
+                          cols            = "lightgrey") +
+    ggtitle(paste("Muestra:", muestra)) +
+    theme_bw() +
+    theme(legend.position = "none")
+
+  ggsave(paste0(ruta_imagenes, "UMAP_highlight_", muestra, ".png"),
+         plot = p_highlight, width = 8, height = 7, bg = "white")
+}
+
+cat("UMAPs highlight guardados para", length(lista_muestras), "muestras.\n")
+```
+
+---
+
+# Marcadores canónicos — FeaturePlots
+
+Estos plots permiten identificar visualmente en qué zona del UMAP se expresan los marcadores de referencia de cada subtipo monocítico. Inspeccionarlos junto con los DotPlots antes de asignar identidades a los clusters.
+
+```{r featureplot_canonicos, fig.height=10, fig.width=12}
+p_features_mono <- FeaturePlot(seu_mono, reduction = "umap",
+                                features = c("CD14", "FCGR3A", "CX3CR1",
+                                             "S100A8", "S100A9", "SELL",
+                                             "HLA-DRA", "FCGR1A", "CCR2"),
+                                ncol = 3)
+print(p_features_mono)
+
+ggsave(paste0(ruta_imagenes, "FeaturePlot_marcadores_canonicos.jpg"),
+       plot = p_features_mono, width = 12, height = 10, dpi = 300, bg = "white")
+```
+
+Referencia de interpretación:
+
+| Marcadores                              | Subtipo                  |
+|-----------------------------------------|--------------------------|
+| CD14++, FCGR3A−, S100A8+, CCR2+        | Monocitos clásicos       |
+| CD14+, FCGR3A++, CX3CR1+, SELL−        | Monocitos no clásicos    |
+| CD14++, FCGR3A+, HLA-DRA++, FCGR1A++  | Monocitos intermedios    |
+
+```{r featureplot_plaquetas, fig.height=5, fig.width=10}
+# Verificación de contaminación plaquetaria (PF4, PPBP son marcadores de plaquetas)
+# Si algún cluster muestra expresión alta de estos genes, puede ser un artefacto
+# de agregación plaqueta-monocito frecuente en sangre periférica neonatal.
+FeaturePlot(seu_mono, reduction = "umap",
+            features = c("PF4", "PPBP"), ncol = 2)
+```
+
+---
+
+# DotPlots de caracterización
+
+## Parámetros de orden
+
+```{r orden_dotplot}
+# ── AJUSTAR TRAS INSPECCIONAR LOS UMAPS Y FEATUREPLOTS ────────────────────────
+#
+# cluster_order: vector con los IDs numéricos de tus clusters en el orden que
+# quieres que aparezcan en el eje Y del DotPlot (de arriba a abajo).
+# Reordenarlos según la identidad biológica que asignes a cada cluster:
+# ej. clásicos → intermedios → no clásicos → DCs → resto.
+#
+# Ejemplo si tienes 6 clusters y el 0=clásicos, 2=intermedios, 1=no clásicos, etc.:
+#   cluster_order <- c("0", "2", "1", "3", "4", "5")
+#
+# Déjalo como NULL para que salgan en orden numérico por defecto.
+# ────────────────────────────────────────────────────────────────────────────────
+cluster_order <- NULL   # ← MODIFICAR aquí cuando tengas las identidades
+
+# Si hay orden definido, reordenar los niveles del factor de clusters
+if (!is.null(cluster_order)) {
+  seu_mono@meta.data$seurat_clusters <- factor(seu_mono@meta.data$seurat_clusters,
+                                               levels = cluster_order)
+  Idents(seu_mono) <- seu_mono@meta.data$seurat_clusters
+}
+```
+
+## Genes de caracterización 
+
+Los genes están ordenados de mayor a menor prevalencia esperada en el conjunto mieloide, siguiendo el gradiente clásicos → intermedios → no clásicos. Esta ordenación refleja la transición fenotípica del linaje monocítico.
+
+```{r dotplot_identidad, fig.height=9, fig.width=11}
+# Genes ordenados de más común (izquierda) a más específico/raro (derecha)
+genes_identidad <- c(
+  "CD14", "S100A8", "S100A9", "VCAN", "LYZ", "SELL", "CD36",  # Classical monocytes
+  "CD86", "HLA-DRA", "HLA-DRB1", "CD74", "CD300C",            # Intermediate monocytes
+  "ESAM", "ZBTB46", "TCF4",                                   # Myeloid dendritic cells
+  "FCGR3A", "CX3CR1", "CDKN1C", "CTSS",                       # Non-classical monocytes
+  "CD34", "CD38"                                              # Progenitors
+)
+
+cluster_order <- c("0", "4", "1", "8",   # Classical monocytes
+                   "2",                   # Non-classical monocytes
+                   "3", "5",              # Intermediate monocytes
+                   "6",                   # Myeloid dendritic cells
+                   "9",                   # Plasmacytoid dendritic cells
+                   "7")                   # Platelet mix
+
+seu_mono@meta.data$seurat_clusters <- factor(seu_mono@meta.data$seurat_clusters,
+                                              levels = cluster_order)
+Idents(seu_mono) <- seu_mono@meta.data$seurat_clusters
+
+library(ggplot2)
+library(patchwork)
+
+# ── DOTPLOT base (sin etiquetas de grupo en el eje Y) ─────────────────────────
+etiquetas_y_limpias <- c(
+  "0" = "0", "4" = "4", "1" = "1", "8" = "8",
+  "2" = "2", "3" = "3", "5" = "5",
+  "6" = "6", "9" = "9", "7" = "7"
+)
+
+p_dot <- DotPlot(seu_mono,
+                 features = genes_identidad,
+                 group.by = "seurat_clusters",
+                 col.min  = 0) +
+  RotatedAxis() +
+  scale_color_gradient(low = "lightgrey", high = "blue",
+                       name = "Average Expression\n(log-norm)") +
+  scale_size_continuous(name = "Percent Expressed") +
+  scale_y_discrete(labels = etiquetas_y_limpias) +
+  geom_hline(yintercept = c(4.5, 5.5, 7.5, 8.5, 9.5),
+             linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  labs(x = NULL, y = "Cluster") +
+  theme_classic() +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 10,
+                                    color = "black", face = "italic"),
+    axis.text.y      = element_text(size = 11, color = "black", face = "bold"),
+    legend.position  = "right",
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+
+grupos_df <- data.frame(
+  label = c("Classical\nmonocytes", "Non-classical\nmonocytes",
+            "Intermediate\nmonocytes", "Myeloid\ndendritic cells",
+            "Plasmacytoid\ndendritic cells", "Platelet mix"),
+  ymin  = c(1, 5, 6, 8, 9, 10) - 0.45,
+  ymax  = c(4, 5, 7, 8, 9, 10) + 0.45,
+  fill  = c("#e34459", "#4e79a7", "#f4a261", "#9467bd", "#8c564b", "#aec7e8")
+)
+
+p_lateral <- ggplot(grupos_df) +
+  geom_rect(aes(xmin = 0, xmax = 0.6, ymin = ymin, ymax = ymax, fill = label),
+            color = "white", linewidth = 0.3) +
+  geom_text(aes(x = 0.3, y = (ymin + ymax) / 2, label = label),
+            size = 3, fontface = "bold", color = "black",
+            angle = 90, hjust = 0.5, vjust = 0.5) +
+  scale_fill_manual(values = setNames(grupos_df$fill, grupos_df$label)) +
+  scale_y_continuous(limits = c(0.5, 10.5), expand = c(0, 0)) +
+  theme_void() +
+  theme(legend.position = "none",
+        plot.background = element_rect(fill = "white", color = NA))
+
+
+p_final <- p_lateral + p_dot +
+  plot_layout(widths = c(0.05, 1))
+
+print(p_final)
+
+ggsave(paste0(ruta_imagenes, "DotPlot_identidad_grupos_lateral.jpg"),
+       plot = p_final, width = 16, height = 8, dpi = 300, bg = "white")
+
+```
+
+```{r featureplot_cd36}
+# ── FEATUREPLOT CD36: Control vs HI ──────────────────────────────────────────
+# Separar células por condición
+cells_control <- WhichCells(seu_mono, expression = grupo == "Control")
+cells_hi      <- WhichCells(seu_mono, expression = grupo == "HI")
+
+p_cd36_control <- FeaturePlot(seu_mono,
+                               features = "CD36",
+                               reduction = "umap",
+                               cells    = cells_control,
+                               order    = TRUE) +
+  scale_colour_gradientn(colours = c("lightgrey", "#f4a261", "#e34459"),
+                         name = "CD36") +
+  ggtitle("CD36 — Control") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+p_cd36_hi <- FeaturePlot(seu_mono,
+                          features = "CD36",
+                          reduction = "umap",
+                          cells    = cells_hi,
+                          order    = TRUE) +
+  scale_colour_gradientn(colours = c("lightgrey", "#f4a261", "#e34459"),
+                         name = "CD36") +
+  ggtitle("CD36 — HI") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+p_cd36_combinado <- p_cd36_control | p_cd36_hi
+
+print(p_cd36_combinado)
+
+ggsave(paste0(ruta_imagenes, "FeaturePlot_CD36_Control_vs_HI.jpg"),
+       plot = p_cd36_combinado, width = 14, height = 6, dpi = 300, bg = "white")
+```
+
+
+
+```{r dotplot_identidad_MJ}
+genes_MJ <- c(
+  "CD14", "FCGR1A", "CCR2", "ITGAM", "SELL",
+  "S100A8", "S100A9", "HLA-DRA", "FCGR3A", "CX3CR1",
+  "PF4", "PPBP"
+)
+
+p_dotplot_identidad2 <- DotPlot(seu_mono,
+                             features = genes_MJ,
+                             group.by = "seurat_clusters",
+                             col.min  = 0) +
+  RotatedAxis() +
+  scale_color_gradient(low = "lightgrey", high = "blue",
+                       name = "Avg expression\n(log-norm)") +
+  scale_size_continuous(name = "% expressing") +
+  
+  # Línea vertical para separar visualmente los genes plaquetarios (PF4, PPBP)
+  geom_vline(xintercept = 10.5, linetype = "dashed",
+             color = "grey40", linewidth = 0.5) +
+  
+  labs(x = NULL, y = "Cluster") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11,
+                                color = "black", face = "italic"),
+    axis.text.y = element_text(size = 11, color = "black", face = "bold"),
+    legend.position  = "right",
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+print(p_dotplot_identidad2)
+
+ggsave(paste0(ruta_imagenes, "DotPlot_marcadores.jpg"),
+       plot = p_dotplot_identidad2, width = 11, height = 6, dpi = 300, bg = "white")
+```
+
+## Dotplot dendríticas
+
+```{r feature_plots_DC, fig.height=12, fig.width=12}
+# ── FeaturePlots por subpoblación dendrítica ────────────────────────────────────
+
+# cDC1
+p_cdc1 <- FeaturePlot(seu_mono, reduction = "umap", features = c("XCR1", "CLEC9A", "BATF3", "IRF8"),
+                      ncol = 2) &
+  theme(plot.title = element_text(size = 11))
+p_cdc1
+ggsave(filename = paste0(ruta_imagenes, "DC_cDC1_mo.png"),
+       plot = p_cdc1, width = 10, height = 8, dpi = 300)
+
+# cDC2
+p_cdc2 <- FeaturePlot(seu_mono, reduction = "umap", features = c("CD209", "SIRPA", "ITGAM"),
+                      ncol = 3) &
+  theme(plot.title = element_text(size = 11))
+p_cdc2
+ggsave(filename = paste0(ruta_imagenes, "DC_cDC2_mo.png"),
+       plot = p_cdc2, width = 13, height = 5, dpi = 300)
+
+# pDC
+p_pdc <- FeaturePlot(seu_mono,  reduction = "umap", features = c("SIGLEC6", "CLEC4C", "IRF7", "CCR9"),
+                     ncol = 2) &
+  theme(plot.title = element_text(size = 11))
+p_pdc
+ggsave(filename = paste0(ruta_imagenes, "DC_pDC_mo.png"),
+       plot = p_pdc, width = 10, height = 8, dpi = 300)
+
+# migDC
+p_mig <- FeaturePlot(seu_mono, reduction = "umap", features = c("CCR7", "FSCN1"),
+                     ncol = 2) &
+  theme(plot.title = element_text(size = 11))
+p_mig
+ggsave(filename = paste0(ruta_imagenes, "DC_migDC_mo.png"),
+       plot = p_mig, width = 10, height = 5, dpi = 300)
+
+# mDC
+p_mdc <- FeaturePlot(seu_mono,  reduction = "umap", features = c("ITGAX", "MS4A7", "LYZ", "LILRA4"),
+                     ncol = 2) &
+  theme(plot.title = element_text(size = 11))
+p_mdc
+ggsave(filename = paste0(ruta_imagenes, "DC_mDC_mo.png"),
+       plot = p_mdc, width = 13, height = 10, dpi = 300)
+
+#Dendríticas mieloides
+p_mieloides <- FeaturePlot(seu_mono,  reduction = "umap", features = c("CD86", "HLA-DRA", "HLA-DRB1", "CD74"),
+                     ncol = 2) &
+  theme(plot.title = element_text(size = 11))
+p_mieloides
+ggsave(filename = paste0(ruta_imagenes, "DC_mDC_mieloides.png"),
+       plot = p_mieloides, width = 13, height = 10, dpi = 300)
+
+```
+
+```{r dotplot_DC, fig.height=7, fig.width=14}
+# ── DotPlot consolidado — todos los marcadores dendríticos por cluster ──────────
+# Permite ver de un vistazo en qué clusters se concentra cada subpoblación DC
+
+marcadores_dc <- c(
+  # cDC1
+  "XCR1", "CLEC9A", "BATF3", "IRF8", "FLT3", "ZBTB46",
+  # cDC2
+  "CD209", "SIRPA", "ITGAM",
+  # pDC
+  "SIGLEC6", "CLEC4C", "IRF7", "CCR9", "PACSIN1",
+  # migDC
+  "CCR7", "FSCN1",
+  # mDC
+  "ITGAX", "MS4A7", "LYZ"
+)
+
+dot_dc <- DotPlot(seu_mono, features = marcadores_dc, group.by = "seurat_clusters") +
+  scale_color_gradient2(low = "steelblue", mid = "lightyellow", high = "red",
+                        midpoint = 0) +
+  theme(axis.text.x        = element_text(angle = 45, hjust = 1, size = 10),
+        axis.text.y        = element_text(size = 10),
+        plot.title         = element_text(hjust = 0.5),
+        panel.background   = element_rect(fill = "white", color = NA),
+        plot.background    = element_rect(fill = "white", color = NA)) +
+  labs(title = NULL, x = NULL, y = "Cluster")
+
+# Añadir líneas separadoras entre subpoblaciones
+dot_dc <- dot_dc +
+  geom_vline(xintercept = c(6.5, 9.5, 14.5, 16.5),
+             linetype = "dashed", color = "gray50", linewidth = 0.4) +
+  annotate("text", x = 3.5,  y = -0.7, label = "cDC1",  size = 3.5, color = "gray30") +
+  annotate("text", x = 8,    y = -0.7, label = "cDC2",  size = 3.5, color = "gray30") +
+  annotate("text", x = 12,   y = -0.7, label = "pDC",   size = 3.5, color = "gray30") +
+  annotate("text", x = 15.5, y = -0.7, label = "migDC", size = 3.5, color = "gray30") +
+  annotate("text", x = 18,   y = -0.7, label = "mDC",   size = 3.5, color = "gray30")
+
+dot_dc
+
+ggsave(filename = paste0(ruta_imagenes, "DotPlot_DC_", ".png"),
+       plot = dot_dc, width = 14, height = 7, dpi = 300)
+```
+
+
+
+## DotPlot partido por condición (Control vs HI)
+
+Sirve para comprobar que los genes de identidad del linaje no varían entre grupos — si hay diferencias llamativas aquí, podrían ser biológicas y no solo técnicas.
+
+```{r dotplot_condicion, fig.height=8, fig.width=13}
+p_dotplot_condicion <- DotPlot(seu_mono,
+                                features = genes_identidad,
+                                split.by = "grupo",
+                                col.min  = 0) +
+  RotatedAxis() +
+  labs(x = NULL, y = "Cluster — Condición",
+       title = "Identidad monocítica: Control vs HI") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9,
+                                color = "black", face = "italic"),
+    axis.text.y = element_text(size = 10, color = "black"),
+    legend.position  = "right",
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+print(p_dotplot_condicion)
+
+ggsave(paste0(ruta_imagenes, "DotPlot_condicion_Control_vs_HI.jpg"),
+       plot = p_dotplot_condicion, width = 13, height = 8, dpi = 300, bg = "white")
+```
+
+## DotPlot top 5 marcadores diferenciales por cluster
+
+Este DotPlot usa los marcadores calculados por `FindAllMarkers` en el script anterior. Los genes están ordenados por cluster, y dentro de cada cluster por avg_log2FC descendente.
+
+```{r dotplot_top5, fig.height=6, fig.width=13}
+# Cargar la tabla de marcadores guardada en el script anterior
+ruta_markers <- paste0(ruta_out, "Markers_Top5_monocytes.csv")
+
+if (file.exists(ruta_markers)) {
+  top5_mono <- read.csv(ruta_markers)
+
+  # Ordenar genes: primero por cluster, luego por avg_log2FC descendente
+  # Esto pone los genes del cluster más común/grande a la izquierda
+  genes_top5_ordenados <- top5_mono %>%
+    arrange(cluster, desc(avg_log2FC)) %>%
+    pull(gene) %>%
+    unique()
+
+  p_dotplot_top5 <- DotPlot(seu_mono,
+                             features = genes_top5_ordenados,
+                             group.by = "seurat_clusters",
+                             col.min  = 0) +
+    RotatedAxis() +
+    scale_color_gradient(low = "lightgrey", high = "#E64B35",
+                         name = "Avg expression\n(log-norm)") +
+    scale_size_continuous(name = "% expressing") +
+    labs(x = "Top 5 markers per cluster", y = "Cluster") +
+    theme_classic() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 9,
+                                  color = "black", face = "italic"),
+      axis.text.y = element_text(size = 11, color = "black", face = "bold"),
+      legend.position  = "right",
+      plot.background  = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA)
+    )
+
+  print(p_dotplot_top5)
+
+  ggsave(paste0(ruta_imagenes, "DotPlot_Top5_marcadores_diferenciales.jpg"),
+         plot = p_dotplot_top5, width = 13, height = 6, dpi = 300, bg = "white")
+
+} else {
+  message("No se encontró el archivo de marcadores en: ", ruta_markers,
+          "\nEjecutar primero el script de reclustering (script 4).")
+}
+```
+
+---
+
+# Violines de marcadores canónicos
+
+```{r violin_canonicos, fig.height=8, fig.width=14}
+p_violin <- VlnPlot(seu_mono,
+                     features = c("CD14", "FCGR3A", "CX3CR1",
+                                  "S100A8", "HLA-DRA", "SELL",
+                                  "PPBP", "NKG7"),
+                     pt.size = 0, ncol = 4)
+
+print(p_violin)
+
+ggsave(paste0(ruta_imagenes, "Violin_marcadores_canonicos.jpg"),
+       plot = p_violin, width = 14, height = 8, dpi = 300, bg = "white")
+```
+
+---
+
+# Composición celular
+
+## Por muestra
+
+```{r composicion_muestras, fig.height=6, fig.width=10}
+tabla_composicion <- seu_mono@meta.data %>%
+  filter(!is.na(SingleR.Mono.Fine)) %>%
+  group_by(orig.ident, grupo, SingleR.Mono.Fine) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(orig.ident) %>%
+  mutate(pct = round(n / sum(n) * 100, 1),
+         Total = sum(n))
+
+tabla_totales <- tabla_composicion %>%
+  select(orig.ident, Total) %>%
+  distinct()
+
+p_composicion_muestras <- ggplot(tabla_composicion,
+                                  aes(x = orig.ident, y = n, fill = SingleR.Mono.Fine)) +
+  geom_bar(stat = "identity", position = "fill",
+           color = "white", linewidth = 0.2) +
+  geom_text(aes(label = ifelse(pct > 5, paste0(pct, "%"), "")),
+            position = position_fill(vjust = 0.5),
+            size = 3, fontface = "bold", color = "black") +
+  geom_text(data = tabla_totales,
+            aes(x = orig.ident, y = 1, label = paste0("N=", Total)),
+            inherit.aes = FALSE, vjust = -0.4, size = 3.5, fontface = "bold") +
+  scale_y_continuous(labels = percent_format(),
+                     expand  = expansion(mult = c(0, 0.07))) +
+  scale_fill_manual(values = colores_mieloides, na.value = "grey80") +
+  labs(x = "Muestra", y = "Proporción de células", fill = "Subtipo (Monaco Fine)") +
+  theme_classic() +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, size = 11,
+                                  color = "black", face = "bold"),
+    axis.text.y  = element_text(size = 11, color = "black"),
+    axis.title   = element_text(size = 12, face = "bold"),
+    legend.position  = "bottom",
+    legend.text  = element_text(size = 10),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+print(p_composicion_muestras)
+
+ggsave(paste0(ruta_imagenes, "Composicion_por_muestra.jpg"),
+       plot = p_composicion_muestras, width = 9, height = 11, dpi = 300, bg = "white")
+```
+
+## Control vs HI
+
+```{r composicion_grupos, fig.height=9, fig.width=6}
+tabla_grupos <- seu_mono@meta.data %>%
+  filter(!is.na(SingleR.Mono.Fine)) %>%
+  group_by(grupo, SingleR.Mono.Fine) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(grupo) %>%
+  mutate(pct = round(n / sum(n) * 100, 2)) %>%
+  arrange(grupo, desc(pct))
+
+p_composicion_grupos <- ggplot(tabla_grupos,
+                                aes(x = grupo, y = pct, fill = SingleR.Mono.Fine)) +
+  geom_bar(stat = "identity", position = "fill",
+           color = "white", linewidth = 0.3) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(values = colores_mieloides, na.value = "grey80") +
+  labs(x = NULL, y = "Proporción de células", fill = "Subtipo (Monaco Fine)") +
+  theme_classic() +
+  theme(
+    axis.text.x  = element_text(size = 13, color = "black", face = "bold"),
+    axis.text.y  = element_text(size = 11, color = "black"),
+    legend.position  = "bottom",
+    legend.text  = element_text(size = 10),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+print(p_composicion_grupos)
+
+ggsave(paste0(ruta_imagenes, "Composicion_Control_vs_HI.jpg"),
+       plot = p_composicion_grupos, width = 8, height = 12, dpi = 300, bg = "white")
+
+# Tabla numérica de diferencias
+tabla_diff <- tabla_grupos %>%
+  select(grupo, SingleR.Mono.Fine, pct) %>%
+  pivot_wider(names_from = grupo, values_from = pct, values_fill = 0) %>%
+  mutate(diff_HI_vs_Control = round(HI - Control, 2)) %>%
+  arrange(desc(abs(diff_HI_vs_Control)))
+
+cat("Diferencias de composición HI vs Control:\n")
+print(tabla_diff)
+
+write.csv(tabla_diff,
+          file = paste0(ruta_out, "composicion_HI_vs_Control.csv"),
+          row.names = FALSE)
+```
+
+---
+
+# UMAP final con identidades asignadas
+
+Una vez inspeccionados los DotPlots, FeaturePlots y violines, rellenar aquí las identidades manuales de cada cluster y generar el UMAP definitivo.
+
+```{r umap_identidades_manuales, fig.height=9, fig.width=10}
+# ── RELLENAR TRAS LA CARACTERIZACIÓN ──────────────────────────────────────────
+# Asignar un nombre biológico a cada cluster numérico.
+# Formato: c("0" = "Classical monocytes", "1" = "Non classical monocytes", ...)
+# Dejar como NULL hasta tener las identidades claras.
+# ────────────────────────────────────────────────────────────────────────────────
+identidades_manuales <- NULL  # ← MODIFICAR aquí
+
+if (!is.null(identidades_manuales)) {
+  seu_mono <- RenameIdents(seu_mono, identidades_manuales)
+  seu_mono@meta.data$cell_type_manual <- Idents(seu_mono)
+
+  p_umap_final <- DimPlot(seu_mono, reduction = "umap",
+                           label = TRUE, label.size = 4.5, repel = TRUE) +
+    scale_color_manual(values = colores_mieloides) +
+    ggtitle("Subpoblaciones mieloides — anotación manual") +
+    theme(plot.title      = element_text(hjust = 0.5, size = 13),
+          legend.position = "bottom",
+          legend.text     = element_text(size = 10)) +
+    guides(color = guide_legend(ncol = 3, override.aes = list(size = 3)))
+
+  print(p_umap_final)
+
+  ggsave(paste0(ruta_imagenes, "UMAP_identidades_manuales.jpg"),
+         plot = p_umap_final, width = 10, height = 9, dpi = 300, bg = "white")
+} else {
+  message("identidades_manuales = NULL — ejecutar después de caracterizar los clusters.")
+  # Mientras tanto, mostrar el UMAP con clusters numéricos + anotación SingleR encima
+  print(p_singler_fine)
+}
+```
+
+
+```{r umap_monocitos_finelabel}
+tipos_seleccionados <- c(
+  "Classical monocytes",
+  "Intermediate monocytes",
+  "Non classical monocytes",
+  "Myeloid dendritic cells",
+  "Plasmacytoid dendritic cells",
+  "Progenitor cells"
+)
+
+# Crear columna con NA para las células que no son de esos tipos
+seu_mono@meta.data$SingleR_subset <- ifelse(
+  seu_mono$SingleR.Mono.Fine %in% tipos_seleccionados,
+  seu_mono$SingleR.Mono.Fine,
+  NA
+)
+
+colores_subset <- c(
+  "Classical monocytes"    = "darkolivegreen1",
+  "Non-classical monocytes"= "#97FFFF",
+  "Intermediate monocytes" = "lightgoldenrod1",
+  "Myeloid DCs"            = "orchid2",
+  "Plasmacytoid DCs"       = "wheat3",
+  "Platelet mix"           = "lightpink1"
+)
+
+p_umap_subset <- DimPlot(seu_mono,
+                          reduction = "umap",
+                          group.by  = "SingleR_subset",
+                          na.value  = "grey85",
+                          label     = TRUE,
+                          label.size = 3.5,
+                          repel     = TRUE) +
+  scale_color_manual(values = colores_subset, na.value = "grey85") +
+  ggtitle("Subpoblaciones mieloides — Monaco Fine") +
+  theme(plot.title      = element_text(hjust = 0.5, size = 13),
+        legend.position = "bottom",
+        legend.text     = element_text(size = 10)) +
+  guides(color = guide_legend(ncol = 3, override.aes = list(size = 3)))
+
+print(p_umap_subset)
+
+ggsave(paste0(ruta_imagenes, "UMAP_subpoblaciones_mieloides.jpg"),
+       plot = p_umap_subset, width = 10, height = 9, dpi = 300, bg = "white")
+```
+
+---
+
+# Exportar PDF resumen
+
+```{r export_pdf}
+ruta_pdf <- paste0(ruta_imagenes, "PDF_caracterizacion_monocitos.pdf")
+
+pdf(ruta_pdf, width = 14, height = 10)
+
+# Contexto
+print(p_clusters | p_muestra | p_grupo)
+
+# Anotación automática
+print(p_singler_fine)
+
+# Marcadores canónicos
+print(p_features_mono)
+
+# DotPlot identidad
+print(p_dotplot_identidad)
+
+# DotPlot condición
+print(p_dotplot_condicion)
+
+# DotPlot top5 (si existe)
+if (exists("p_dotplot_top5")) print(p_dotplot_top5)
+
+# Composición por muestra y grupo
+print(p_composicion_muestras)
+print(p_composicion_grupos)
+
+# UMAP final (si identidades están asignadas)
+if (!is.null(identidades_manuales) && exists("p_umap_final")) print(p_umap_final)
+
+dev.off()
+cat("PDF resumen guardado en:", ruta_pdf, "\n")
+```
+
+# Caracterización de los clusters como tipos celulares
+
+```{r dotplot_identidad, fig.height=9, fig.width=11}
+# Genes ordenados de más común (izquierda) a más específico/raro (derecha)
+genes_identidad <- c(
+  "CD14", "S100A8", "S100A9", "VCAN", "LYZ", "SELL", "CD36",  # Classical monocytes
+  "FCGR3A", "CX3CR1", "CDKN1C", "CTSS",                       # Non-classical monocytes
+  "CD38",                                                     # Intermediate monocytes
+  "CD86", "HLA-DRA", "HLA-DRB1", "CD74",                      # Dendriticas mieloides
+  "IRF8", "TCF4", "LILRA4",                                  # plasmacitoides dendritic cells
+  "CD34",                                                    # Progenitors
+  "PPBP", "PF4"
+)
+
+cluster_order <- c("0", "4", "1", "8",    # Classical monocytes
+                   "2",                   # Non-classical monocytes
+                   "3", "5",              # Intermediate monocytes
+                   "6",                   # Myeloid dendritic cells
+                   "9",                   # Plasmacytoid dendritic cells
+                   "7")                   # Platelet mix
+
+seu_mono@meta.data$seurat_clusters <- factor(seu_mono@meta.data$seurat_clusters,
+                                              levels = cluster_order)
+Idents(seu_mono) <- seu_mono@meta.data$seurat_clusters
+
+library(ggplot2)
+library(patchwork)
+
+# ── DOTPLOT base (sin etiquetas de grupo en el eje Y) ─────────────────────────
+etiquetas_y_limpias <- c(
+  "0" = "0", "4" = "4", "1" = "1", "8" = "8",
+  "2" = "2", "3" = "3", "5" = "5",
+  "6" = "6", "9" = "9", "7" = "7"
+)
+
+p_dot <- DotPlot(seu_mono,
+                 features = genes_identidad,
+                 group.by = "seurat_clusters",
+                 scale = T) +
+  RotatedAxis() +
+  scale_color_gradient(low = "lightgrey", high = "blue",
+                       name = "Average Expression\n(log-norm)") +
+  scale_size_continuous(name = "Percent Expressed") +
+  scale_y_discrete(labels = etiquetas_y_limpias) +
+  geom_hline(yintercept = c(4.5, 5.5, 7.5, 8.5, 9.5),
+             linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  labs(x = NULL, y = "Cluster") +
+  theme_classic() +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 10,
+                                    color = "black", face = "italic"),
+    axis.text.y      = element_text(size = 11, color = "black", face = "bold"),
+    legend.position  = "right",
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+
+grupos_df <- data.frame(
+  label = c("Classical\nmonocytes", "Non-classical\nmonocytes",
+            "Intermediate\nmonocytes", "Myeloid\nDCs",
+            "Plasmacytoid\nDCs", "Platelet mix"),
+  ymin  = c(1, 5, 6, 8, 9, 10) - 0.45,
+  ymax  = c(4, 5, 7, 8, 9, 10) + 0.45,
+  fill  = c("darkolivegreen1", "#97FFFF", "lightgoldenrod1", "orchid1", "wheat1", "lightpink1")
+)
+
+p_lateral <- ggplot(grupos_df) +
+  geom_rect(aes(xmin = 0, xmax = 0.6, ymin = ymin, ymax = ymax, fill = label),
+            color = "white", linewidth = 0.3) +
+  geom_text(aes(x = 0.3, y = (ymin + ymax) / 2, label = label),
+            size = 3, fontface = "bold", color = "black",
+            angle = 90, hjust = 0.5, vjust = 0.5) +
+  scale_fill_manual(values = setNames(grupos_df$fill, grupos_df$label)) +
+  scale_y_continuous(limits = c(0.5, 10.5), expand = c(0, 0)) +
+  theme_void() +
+  theme(legend.position = "none",
+        plot.background = element_rect(fill = "white", color = NA))
+
+
+p_final <- p_lateral + p_dot +
+  plot_layout(widths = c(0.05, 1))
+
+print(p_final)
+
+ggsave(paste0(ruta_imagenes, "DotPlot_MARKERS_mo.jpg"),
+       plot = p_final, width = 16, height = 8, dpi = 300, bg = "white")
+
+```
+
+```{r dotplot_identidad_split, fig.height=9, fig.width=18}
+
+p_dot_split <- DotPlot(seu_mono,
+                       features   = genes_identidad,
+                       group.by   = "seurat_clusters",
+                       split.by   = "grupo",
+                       scale      = TRUE) +
+  RotatedAxis() +
+  scale_y_discrete(labels = etiquetas_y_limpias) +
+  geom_hline(yintercept = c(8.5, 10.5, 14.5, 16.5, 17.5),
+             linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  labs(x = NULL, y = "Cluster") +
+  theme_classic() +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 10,
+                                    color = "black", face = "italic"),
+    axis.text.y      = element_text(size = 11, color = "black", face = "bold"),
+    legend.position  = "right",
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    strip.text       = element_text(size = 12, face = "bold")  # título de cada panel
+  )
+
+p_final_split <- p_lateral + p_dot_split +
+  plot_layout(widths = c(0.05, 1))
+
+print(p_final_split)
+
+ggsave(paste0(ruta_imagenes, "DotPlot_MARKERS_mo_split.jpg"),
+       plot = p_final_split, width = 18, height = 9, dpi = 300, bg = "white")
+```
+
+```{r annotate_clusters}
+# ── Anotación manual de clusters según DotPlot ─────────────────────────────────
+anotacion_manual <- c(
+  "0" = "Classical monocytes",
+  "1" = "Classical monocytes",
+  "2" = "Non-classical monocytes",
+  "3" = "Intermediate monocytes",
+  "4" = "Classical monocytes",
+  "5" = "Intermediate monocytes",
+  "6" = "Myeloid DCs",
+  "7" = "Platelet mix",
+  "8" = "Classical monocytes",
+  "9" = "Plasmacytoid DCs"
+)
+
+seu_mono <- RenameIdents(seu_mono, anotacion_manual)
+seu_mono[["cell_type"]] <- Idents(seu_mono)
+
+cat("Distribución de tipos celulares:\n")
+print(table(seu_mono$cell_type))
+
+```
+```{r tabla_anotacion_cluster}
+library(openxlsx)
+
+# ── Tabla con desglose por condición ───────────────────────────────────────────
+# Conteos: cluster x (cell_type + condición)
+df_conteos <- seu_mono@meta.data %>%
+  group_by(seurat_clusters, cell_type, grupo) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(col_nombre = paste0(cell_type, " (", grupo, ")")) %>%
+  select(seurat_clusters, col_nombre, n) %>%
+  tidyr::pivot_wider(names_from = col_nombre, values_from = n, values_fill = 0) %>%
+  rename(Cluster = seurat_clusters)
+
+# Ordenar columnas: agrupar por tipo celular (Control, HI juntos)
+tipos <- c("Classical monocytes", "Non-classical monocytes", "Intermediate monocytes",
+           "Myeloid DCs", "Plasmacytoid DCs", "Platelet mix")
+condiciones <- c("Control", "HI")
+
+cols_ordenadas <- c("Cluster",
+                    as.vector(outer(tipos, condiciones,
+                                    FUN = function(t, c) paste0(t, " (", c, ")"))))
+# Conservar solo columnas que existan (por si alguna combinación tiene 0 células)
+cols_ordenadas <- cols_ordenadas[cols_ordenadas %in% colnames(df_conteos)]
+df_conteos <- df_conteos[, cols_ordenadas]
+
+# ── Crear Excel ─────────────────────────────────────────────────────────────────
+wb <- createWorkbook()
+addWorksheet(wb, "Anotación Monocitos")
+writeData(wb, "Anotación Monocitos", df_conteos)
+
+colores_excel <- c(
+  "Classical monocytes"     = "#CAFF70",
+  "Non-classical monocytes" = "#97FFFF",
+  "Intermediate monocytes"  = "#FFEC8B",
+  "Myeloid DCs"             = "#EE7AE9",
+  "Plasmacytoid DCs"        = "#CDBA96",
+  "Platelet mix"            = "#FFAEB9"
+)
+
+# Estilo columna Cluster
+addStyle(wb, "Anotación Monocitos",
+         style = createStyle(fgFill = "#E0E0E0", halign = "center",
+                             textDecoration = "bold"),
+         rows = 1, cols = 1)
+
+# Estilo header por tipo celular (color del tipo, independientemente de condición)
+for (i in 2:ncol(df_conteos)) {
+  nombre_col  <- colnames(df_conteos)[i]
+  tipo_celular <- gsub(" \\(.*\\)", "", nombre_col)  # extrae el tipo sin "(Control)"/"(HI)"
+  color_col   <- colores_excel[tipo_celular]
+
+  addStyle(wb, "Anotación Monocitos",
+           style = createStyle(fgFill = color_col, halign = "center",
+                               textDecoration = "bold"),
+           rows = 1, cols = i)
+}
+
+# Ancho de columnas automático
+setColWidths(wb, "Anotación Monocitos", cols = 1:ncol(df_conteos), widths = "auto")
+
+saveWorkbook(wb, file = paste0(ruta_out, "Tabla_Identidad_Monocitos.xlsx"), overwrite = TRUE)
+cat("Excel guardado en:", paste0(ruta_out, "Tabla_Identidad_Monocitos.xlsx"), "\n")
+```
+
+```{r umap_annotated, fig.height=7, fig.width=9}
+colores_celltypes <- c(
+  "Classical monocytes"    = "darkolivegreen1",
+  "Non-classical monocytes"= "#97FFFF",
+  "Intermediate monocytes" = "lightgoldenrod1",
+  "Myeloid DCs"            = "orchid2",
+  "Plasmacytoid DCs"       = "wheat3",
+  "Platelet mix"           = "lightpink1"
+)
+
+p_umap_annot <- DimPlot(seu_mono, reduction = "umap",
+                         group.by = "cell_type",
+                         cols = colores_celltypes,
+                         label = F, label.size = 4, repel = TRUE) +
+  theme(plot.background  = element_rect(fill = "white", color = NA),
+        panel.background = element_rect(fill = "white", color = NA),
+        legend.position  = "bottom") +
+  guides(color = guide_legend(ncol = 3, override.aes = list(size = 4)))
+
+p_umap_annot
+
+ggsave(paste0(ruta_imagenes, "UMAP_annotated_mo.png"),
+       plot = p_umap_annot, width = 10, height = 9, dpi = 300)
+```
+
+```{r barplot_condition, fig.height=6, fig.width=9}
+# Añadir n al label del eje X
+n_labels <- seu_mono@meta.data %>%
+  count(grupo) %>%
+  mutate(label = paste0(grupo, "\n(n = ", n, ")"))
+label_map <- setNames(n_labels$label, n_labels$grupo)
+
+df_bar <- seu_mono@meta.data %>%
+  group_by(grupo, cell_type) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(grupo) %>%
+  mutate(pct = n / sum(n) * 100)
+
+p_bar <- ggplot(df_bar, aes(x = grupo, y = pct, fill = cell_type)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.6) +
+  scale_fill_manual(values = colores_celltypes) +
+  scale_x_discrete(labels = label_map) +
+  labs(title = NULL,
+       x = NULL, y = "% cells", fill = "Tipo celular") +
+  theme_classic() +
+  theme(plot.background  = element_rect(fill = "white", color = NA),
+        panel.background = element_rect(fill = "white", color = NA),
+        axis.text.x      = element_text(size = 12),
+        axis.text.y      = element_text(size = 11),
+        legend.text      = element_text(size = 10),
+        plot.title       = element_text(hjust = 0.5)) +
+  geom_text(aes(label = ifelse(pct > 3, paste0(round(pct, 1), "%"), "")),
+            position = position_stack(vjust = 0.5), size = 3.5, color = "black")
+
+p_bar
+
+ggsave(paste0(ruta_imagenes, "Barplot_condition_monos.png"),
+       plot = p_bar, width = 9, height = 6, dpi = 300)
+```
+
+# Guardado final
+```{r save_annotated}
+saveRDS(seu_mono, file = ruta_rds_mono)
+cat("Objeto anotado guardado en:", ruta_rds_mono, "\n")
+```

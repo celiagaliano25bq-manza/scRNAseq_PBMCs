@@ -1,0 +1,950 @@
+---
+title: "Preprocesamiento_scRNAseq"
+subtitle: "Muestra: HI11_B7"
+author: "Celia Galiano Manzanares"
+date: '`r format(Sys.Date(), "%d de %B de %Y")`'
+output:
+  html_document:
+    theme: united
+    df_print: kable
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+# Este chunk configura el comportamiento global del documento HTML final.
+
+all_times <- list()
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now, units = "secs")
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 95),
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE,
+  error = TRUE
+)
+```
+
+> **Nota de uso:** Modificar únicamente los valores del chunk `init` para procesar cada muestra de forma independiente. Los parámetros `dims_use` pueden requerir ajuste manual por muestra tras inspeccionar el ElbowPlot.
+
+## Setup y parámetros de la muestra
+
+```{r libraries}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+library(SoupX)
+library(clustree)
+library(SingleR)
+library(celldex)
+```
+
+```{r init}
+# ── PARÁMETROS A MODIFICAR POR MUESTRA ─────────────────────────────────────────
+nombre_muestra  <- "HI11_B7"
+
+# ── RUTAS BASE ─
+ruta_workspace <- "C:/Users/celia/Escritorio/TFM/workspace/"
+# ────────────────────────────────────────────────────────────────────────────────
+
+# Rutas de entrada (CellRanger output)
+ruta_base     <- paste0(ruta_workspace, "samples/")
+ruta_filtered <- paste0(ruta_base, nombre_muestra, "/filtered_feature_bc_matrix/")
+ruta_raw      <- paste0(ruta_base, nombre_muestra, "/raw_feature_bc_matrix/")
+
+# Rutas de salida — todas bajo workspace/output/
+ruta_out          <- paste0(ruta_workspace, "output/")
+ruta_imagenes     <- paste0(ruta_out, "images/")
+ruta_rds_general  <- paste0(ruta_out, "rds/mapageneral_",  nombre_muestra, ".rds")
+ruta_rds_final    <- paste0(ruta_out, "rds/",              nombre_muestra, "_final.rds")
+ruta_csv_resumen  <- paste0(ruta_out, "qc_summaries/resumen_qc_",      nombre_muestra, ".csv")
+ruta_csv_anotacion <- paste0(ruta_out, "qc_summaries/anotacion_comparativa_", nombre_muestra, ".csv")
+
+# Crear carpetas de salida si no existen (evita errores al guardar)
+for (d in c(ruta_imagenes,
+            paste0(ruta_out, "rds/"),
+            paste0(ruta_out, "qc_summaries/"))) {
+  if (!dir.exists(d)) {
+    dir.create(d, recursive = TRUE)
+    cat("Carpeta creada:", d, "\n")
+  }
+}
+
+cat("── Rutas configuradas ─────────────────────────────────────\n")
+cat("Entrada filtered:  ", ruta_filtered,    "\n")
+cat("Entrada raw:       ", ruta_raw,         "\n")
+cat("Imágenes:          ", ruta_imagenes,    "\n")
+cat("RDS general:       ", ruta_rds_general, "\n")
+cat("RDS final:         ", ruta_rds_final,   "\n")
+cat("CSV resumen QC:    ", ruta_csv_resumen, "\n")
+cat("CSV anotación:     ", ruta_csv_anotacion, "\n")
+cat("────────────────────────────────────────────────────────────\n")
+```
+
+***
+
+## Visualización pre-filtrado
+
+```{r qc_violin_raw, fig.height=7, fig.width=13, message=FALSE, warning=FALSE}
+# ViolinPlot exploratorio PRE-SoupX: sobre la matriz filtered cruda de CellRanger
+# Solo para inspección visual; no modifica ningún objeto del pipeline.
+sc_filtered_raw <- Read10X(data.dir = ruta_filtered)
+seu_raw <- CreateSeuratObject(counts = sc_filtered_raw, project = nombre_muestra,
+                              min.cells = 3, min.features = 200)
+seu_raw[["percent.MT"]] <- PercentageFeatureSet(seu_raw, pattern = "^MT-")
+seu_raw <- NormalizeData(seu_raw, verbose = FALSE)
+
+vln_raw_genes  <- VlnPlot(seu_raw, features = "nFeature_RNA", pt.size = 0) + ylim(0, 10000) + NoLegend() + ggtitle("Genes — PRE-SoupX")
+vln_raw_counts <- VlnPlot(seu_raw, features = "nCount_RNA",   pt.size = 0) + ylim(0, 50000) + NoLegend() + ggtitle("UMIs — PRE-SoupX")
+vln_raw_mito   <- VlnPlot(seu_raw, features = "percent.MT",   pt.size = 0) + ylim(0, 25)    + NoLegend() + ggtitle("% MT — PRE-SoupX")
+vln_raw_hbb    <- VlnPlot(seu_raw, features = "HBB",          pt.size = 0)                  + NoLegend() + ggtitle("HBB — PRE-SoupX")
+
+vln_raw_genes | vln_raw_counts | vln_raw_mito | vln_raw_hbb
+
+rm(seu_raw)  # Liberar memoria; este objeto es solo exploratorio
+gc()
+```
+
+## Corrección de ARN ambiental (SoupX)
+
+SoupX estima y corrige la contaminación por ARN ambiental (*ambient RNA* o *soup*) presente en las matrices de counts. Esta contaminación proviene de ARN liberado por células rotas durante la preparación de la muestra, que contamina todas las gotículas de forma inespecífica. En muestras de sangre con alta proporción de eritrocitos (como HI11, HI3, C1), el ARN de hemoglobina (HBB, HBA1, HBA2) puede contaminar artificialmente células inmunes, dificultando la identificación y filtrado posterior de eritrocitos.
+
+SoupX requiere dos matrices: la **filtered** (células detectadas por CellRanger) y la **raw** (todas las gotículas, incluyendo las vacías que sirven para estimar el perfil del soup).
+
+
+```{r soupx, message=TRUE}
+# Cargar matrices filtered y raw
+sc_filtered <- Read10X(data.dir = ruta_filtered)
+sc_raw      <- Read10X(data.dir = ruta_raw)
+
+# Crear objeto SoupChannel
+sc <- SoupChannel(tod = sc_raw, toc = sc_filtered)
+
+# Crear un objeto Seurat temporal para estimar los clusters (necesarios para SoupX)
+# Se usan parámetros estándar mínimos: el clustering aquí es solo auxiliar para SoupX
+seurat_tmp <- CreateSeuratObject(counts = sc_filtered)
+seurat_tmp <- NormalizeData(seurat_tmp, verbose = FALSE)
+seurat_tmp <- FindVariableFeatures(seurat_tmp, nfeatures = 2000, verbose = FALSE)
+seurat_tmp <- ScaleData(seurat_tmp, verbose = FALSE)
+seurat_tmp <- RunPCA(seurat_tmp, verbose = FALSE)
+seurat_tmp <- FindNeighbors(seurat_tmp, dims = 1:15, verbose = FALSE)
+seurat_tmp <- FindClusters(seurat_tmp, resolution = 0.5, verbose = FALSE)
+seurat_tmp <- RunUMAP(seurat_tmp, dims = 1:15, verbose = FALSE)
+
+# Añadir información de clusters al objeto SoupX
+# setClusters espera un vector named con nombres = barcodes, valores = cluster ID como character
+clusters_vec <- setNames(as.character(seurat_tmp$seurat_clusters), colnames(seurat_tmp))
+sc <- setClusters(sc, clusters_vec)
+umap_coords <- seurat_tmp@reductions$umap@cell.embeddings
+
+# Estimar la fracción de contaminación (rho) de forma automática
+sc <- autoEstCont(sc, verbose = TRUE)
+cat("Fracción de contaminación estimada (rho):", sc$fit$rho, "\n")
+
+# Corregir los counts
+counts_corregidos <- adjustCounts(sc, roundToInt = TRUE)
+cat("Dimensiones de la matriz corregida:", dim(counts_corregidos), "\n")
+
+rm(seurat_tmp)
+gc()
+```
+
+La fracción de contaminación estimada (rho) indica qué proporción de los counts de cada célula proviene del soup. Valores típicos oscilan entre 2–20%. Valores muy altos (> 20%) en muestras de sangre con muchos eritrocitos son esperables y justifican el uso de SoupX. La corrección reduce la expresión de genes muy abundantes en el soup (especialmente HBB, HBA1, HBA2) sin eliminar células.
+
+```{r soupx_viz, fig.height=5, fig.width=10}
+# Visualizar el efecto de la corrección en genes de hemoglobina
+plotChangeMap(sc, counts_corregidos, geneSet = c("HBB", "HBA1", "HBA2"), DR = umap_coords) +
+  ggtitle(paste("Efecto SoupX en genes de hemoglobina —", nombre_muestra))
+```
+
+Este mapa muestra cuánto ha reducido SoupX la expresión de los genes de hemoglobina en cada célula. Las células más afectadas (mayor corrección) son las no eritroides que mostraban expresión artificial debida al soup. Tras la corrección, la expresión de HBB en células inmunes debería ser cercana a 0.
+
+***
+
+## Setup del objeto Seurat (post-SoupX)
+
+```{r load_data}
+# Crear el objeto Seurat con los counts ya corregidos por SoupX
+# Si SoupX no está disponible (sin raw matrix), sustituir counts_corregidos por sc_filtered
+seu <- CreateSeuratObject(counts = counts_corregidos,
+                             project = nombre_muestra,
+                             min.cells = 3, min.features = 200)
+cat("Células iniciales, tras CreateSeuratObject (min.cells=3, min.features=200):", ncol(seu), "\n")
+n_post_create <- ncol(seu)
+seu
+rm(counts_corregidos, sc_filtered_raw, sc_raw)
+gc()
+```
+
+***
+
+# Standard pre-processing workflow
+
+
+El flujo estándar de preprocesamiento comprende tres etapas principales:
+
+* **Control de calidad (QC):** selección y eliminación de células de baja calidad.
+* **Normalización y escalado:** corrección de diferencias técnicas entre células.
+* **Selección de genes variables:** identificación de los genes más informativos.
+
+# QC y selección de células
+
+## Cálculo de métricas de calidad
+
+```{r mito}
+# Calcular el % de lecturas de genes mitocondriales (prefijo "MT-")
+seu[["percent.MT"]] <- PercentageFeatureSet(seu, pattern = "^MT-")
+
+# Calcular el ratio nFeature/nCount: útil para detectar eritrocitos
+# Los eritrocitos tienen transcriptoma muy reducido → ratio bajo
+# (pocos genes distintos aunque tengan muchos counts de hemoglobina)
+seu[["ratio_features_counts"]] <- seu$nFeature_RNA / seu$nCount_RNA
+```
+
+```{r qc_table}
+head(seu@meta.data, 5)
+```
+
+Las métricas de calidad por célula incluyen:
+
+- **nCount_RNA:** número total de UMIs capturados. Valores muy bajos indican células vacías; valores extremadamente altos, posibles doublets.
+- **nFeature_RNA:** número de genes únicos detectados. Valores < 200: debris o células vacías; valores > 5000: posibles doublets.
+- **percent.MT:** porcentaje de lecturas mitocondriales. Valores elevados (> 5%) indican células dañadas. Los eritrocitos maduros carecen de mitocondrias, por lo que muestran percent.MT ≈ 0%.
+- **ratio_features_counts:** ratio nFeature_RNA / nCount_RNA. Los eritrocitos presentan un ratio muy bajo porque tienen pocos genes distintos (transcriptoma reducido) pero muchos counts concentrados en un pequeño número de transcritos de hemoglobina.
+
+## Visualización pre-filtrado
+
+```{r qc_violin_pre, fig.height=7, fig.width=13}
+plot_genes  <- VlnPlot(seu, features = "nFeature_RNA", pt.size = 0) + ylim(0, 10000) + NoLegend()
+plot_counts <- VlnPlot(seu, features = "nCount_RNA",   pt.size = 0) + ylim(0, 50000) + NoLegend()
+plot_mito   <- VlnPlot(seu, features = "percent.MT",   pt.size = 0) + ylim(0, 25)    + NoLegend()
+plot_hbb    <- VlnPlot(seu, features = "HBB",          pt.size = 0) + NoLegend()
+
+plot_genes | plot_counts | plot_mito | plot_hbb
+```
+
+Los gráficos de violín muestran la distribución de cada métrica sobre el conjunto completo de células antes de aplicar ningún filtro:
+
+- **nFeature_RNA (Genes detectados):** Una distribución con cola superior amplia sugiere la presencia de doublets. Una cola inferior extensa indica células de baja calidad. Los umbrales de filtrado eliminarán ambos extremos.
+- **nCount_RNA (Lecturas totales):** Distribución paralela a la anterior. Refleja la profundidad de secuenciación; la presencia de violín ancho en valores bajos es esperable antes del filtrado.
+- **percent.MT (Porcentaje mitocondrial):** Un porcentaje elevado en muchas células antes del filtrado es habitual en muestras de sangre. El umbral del 5% eliminará las células más comprometidas.
+- **HBB (Nivel de expresión):** Inspección de la expresión de HBB antes del filtrado. Antes de aplicar el filtro de eritrocitos basado en la expresión de HBB, se visualiza su distribución para establecer el umbral apropiado para cada muestra. En presencia de contaminación por ARN de fondo (*ambient RNA*), la expresión de HBB puede aparecer artificialmente elevada en células no eritroides, lo que justifica esta inspección previa. Interpretar estos gráficos antes de proceder: si la mayoría de células presentan expresión de HBB > 0 (incluso en valores bajos), puede indicar contaminación por ARN ambiental. En ese caso, el umbral `HBB < 1` podría ser demasiado restrictivo y eliminar células inmunes válidas. Ajustar el umbral si fuera necesario.
+
+```{r qc_scatter_pre, fig.height=7, fig.width=13}
+plot1 <- FeatureScatter(seu, feature1 = "nCount_RNA", feature2 = "percent.MT",   cols = "darkgray")
+plot2 <- FeatureScatter(seu, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", cols = "darkgray")
+
+plot1 <- plot1 + geom_smooth(method = "lm", color = "red")
+plot2 <- plot2 + geom_smooth(method = "lm", color = "red")
+
+plot1 + plot2
+```
+
+Los gráficos de dispersión (`FeatureScatter`) permiten evaluar la integridad técnica de la muestra:
+
+- **nCount_RNA vs percent.MT:** Se espera una correlación baja o ligeramente negativa (r ≈ 0 a −0.5). Esto indica que la profundidad de secuenciación no está asociada al estrés celular. Una correlación positiva fuerte alertaría de problemas sistemáticos de calidad.
+- **nCount_RNA vs nFeature_RNA:** Se espera una correlación positiva alta (r > 0.7), ya que a mayor número de moléculas capturadas, más genes distintos se detectan. Si la correlación es baja, puede deberse a la heterogeneidad celular propia de las muestras de sangre neonatal (eritroblastos, plaquetas) que serán eliminadas en pasos posteriores.
+
+
+***
+
+# Clustering exploratorio sin filtros — detección de eritrocitos
+
+Antes de aplicar ningún filtro basado en métricas de calidad, se realiza un clustering rápido sobre el objeto sin filtrar. Este paso permite identificar visualmente si los eritrocitos se agrupan en un cluster propio y caracterizarlos mediante sus métricas (ratio bajo, MT ≈ 0, HBB alto), lo que facilita establecer umbrales de filtrado adecuados para cada muestra.
+
+> **Nota:** Este clustering es puramente exploratorio y diagnóstico. No se utilizará para el análisis biológico posterior.
+
+```{r exploratory_clustering, fig.height=8, fig.width=16, message=FALSE, warning=FALSE, results='hide'}
+seu_exp <- NormalizeData(seu, verbose = FALSE)
+seu_exp <- FindVariableFeatures(seu_exp, nfeatures = 2000, verbose = FALSE)
+seu_exp <- ScaleData(seu_exp, verbose = FALSE)
+seu_exp <- RunPCA(seu_exp, verbose = FALSE)
+seu_exp <- FindNeighbors(seu_exp, dims = 1:15, verbose = FALSE)
+seu_exp <- FindClusters(seu_exp, resolution = 0.5, verbose = FALSE)
+seu_exp <- RunUMAP(seu_exp, dims = 1:15, verbose = FALSE)
+
+```
+
+```{r exploratory_umap, fig.height=8, fig.width=16}
+p_exp_clusters <- DimPlot(seu_exp, reduction = "umap", label = TRUE) +
+  ggtitle("Clustering exploratorio (sin filtros)")
+
+p_exp_hbb <- FeaturePlot(seu_exp, features = "HBB") +
+  ggtitle("Expresión de HBB (sin filtros)")
+
+p_exp_mito <- FeaturePlot(seu_exp, features = "percent.MT") +
+  ggtitle("% Mitocondrial (sin filtros)")
+
+p_exp_ratio <- FeaturePlot(seu_exp, features = "ratio_features_counts") +
+  ggtitle("Ratio nFeature/nCount (sin filtros)")
+
+(p_exp_clusters | p_exp_hbb) / (p_exp_mito | p_exp_ratio)
+```
+
+```{r exploratory_violin, fig.height=8, fig.width=14}
+# Métricas por cluster para identificar el cluster eritroide
+VlnPlot(seu_exp,
+        features = c("HBB", "percent.MT", "ratio_features_counts", "nFeature_RNA"),
+        pt.size = 0, ncol = 2) +
+  plot_annotation(title = "Métricas por cluster — Diagnóstico eritrocitos")
+```
+
+Inspeccionar estos gráficos antes de proceder al filtrado:
+
+- El cluster eritroide se caracteriza por: **HBB alto**, **percent.MT ≈ 0%**, **ratio nFeature/nCount muy bajo** y **nFeature_RNA bajo**.
+- Si hay un cluster con estas características bien definidas, los umbrales de filtrado deberían ser suficientes para eliminarlo.
+- Si los eritrocitos están distribuidos entre varios clusters (contaminación difusa), puede indicar que SoupX no ha corregido completamente el soup y sería necesario ajustar los umbrales de HBB.
+
+```{r cell_counts_0}
+cat("── Células antes de cualquier filtro:", ncol(seu), "\n")
+
+rm(seu_exp)
+gc()
+```
+
+***
+
+## Filtrado de células
+
+Los eritrocitos se detectan mediante una combinación de tres criterios complementarios:
+
+1. **Expresión de HBB** (marcador específico de eritrocitos).
+2. **Ratio nFeature/nCount bajo** (transcriptoma reducido, típico de eritrocitos maduros).
+3. **Porcentaje mitocondrial muy bajo** (los eritrocitos maduros carecen de mitocondrias).
+
+Se eliminan células con menos de 200 genes detectados (posibles células vacías o fragmentos) y más de 5000 (posibles doublets), así como las células con porcentaje mitocondrial superior al 5% (células dañadas o en apoptosis).
+
+Este enfoque multi-criterio es más robusto que usar HBB en solitario, especialmente en muestras con contaminación por ARN ambiental donde el umbral óptimo de HBB puede variar entre muestras.
+
+```{r filter_qc}
+#Filtrado estándar de calidad (genes y % mitocondrial)
+seu <- subset(seu,
+                 subset = nFeature_RNA > 200 & nFeature_RNA < 5000 & percent.MT < 5)
+cat("── Células tras filtro QC (200 < nFeature < 5000, MT < 5%):", ncol(seu), "\n")
+n_post_qc <- ncol(seu)
+```
+
+```{r normalize_pre_erythrocyte}
+# Normalizar antes del filtrado de eritrocitos (necesario para el umbral de HBB)
+seu <- NormalizeData(seu, normalization.method = "LogNormalize", scale.factor = 1e4)
+```
+
+```{r filter_erythrocytes}
+# Se eliminan células que cumplan:
+# HBB >= umbral_hbb  (eritrocitos con expresión directa de hemoglobina)
+umbral_hbb   <- 1 
+erythrocyte_cells <- WhichCells(seu, expression = HBB >= umbral_hbb)
+
+cat("Células identificadas como eritrocitos:", length(erythrocyte_cells), "\n")
+n_post_eritro <- ncol(seu)
+seu <- subset(seu, cells = setdiff(colnames(seu), erythrocyte_cells))
+cat("── Células tras filtrado de eritrocitos:", ncol(seu), "\n")
+
+```
+
+```{r cell_counts_checkpoint}
+cat("\n── RESUMEN DE FILTRADO ────────────────────────────────────\n")
+cat("Células tras CreateSeuratObject:     ",n_post_create,  "\n")
+cat("Células tras QC (MT + nFeature):    ", n_postQC, "\n")
+cat("Células conservadas (post-eritro):  ", n_post_eritro, "\n")
+cat("────────────────────────────────────────────────────────────\n")
+
+# Control de muestra con pocas células
+n_celulas <- ncol(seu)
+if (n_celulas < 200) {
+  message("MUESTRA DESCARTADA: ", nombre_muestra, " — solo ",
+          n_celulas, " células. Se detiene el análisis aquí.")
+  knitr::knit_exit()
+}
+```
+
+***
+
+# Identificacion de Genes altamente variables
+
+Se identifican los genes cuya expresión varía más entre células del dataset, distinguiéndolos de los genes housekeeping (expresión constante en todas las células) y genes silenciosos (no expresados). Estos genes variables son los que contienen información biológica relevante para distinguir tipos celulares.
+
+```{r var_features, fig.height=5, fig.width=10}
+seu <- FindVariableFeatures(seu, selection.method = 'vst', nfeatures = 2000)
+
+top10 <- head(VariableFeatures(seu), 10)
+plot1 <- VariableFeaturePlot(seu)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2
+```
+
+En ambos gráficos, el eje X representa la expresión media de cada gen y el eje Y su varianza estandarizada. Los puntos negros son genes con expresión relativamente constante entre células (poca información discriminativa). 
+
+Los puntos rojos son los genes significativamente variables,seleccionados por el método VST (variance-stabilizing transformation), que serán los utilizados en los pasos de reducción dimensional posteriores. Los 10 genes más variables están etiquetados en el panel derecho; en muestras de sangre periférica es habitual encontrar genes de hemoglobina, inmunoglobulinas y genes de respuesta inflamatoria entre los más variables.
+
+***
+
+# Escalado de datos
+
+El escalado es necesario para evitar que genes con alta expresión absoluta dominen el análisis, ocultando la señal biológica de genes con expresión baja pero biológicamente relevante. Comprende dos operaciones:
+
+- **Centrado:** resta la media de expresión de cada gen, de forma que la nueva media global sea 0 (eliminación del ruido de fondo sistemático).
+- **Escalado:** divide por la desviación estándar, de forma que la varianza de cada gen sea 1 (todos los genes tienen el mismo peso estadístico en el PCA).
+
+```{r scale}
+all.genes <- rownames(seu)
+seu <- ScaleData(seu, features = all.genes)
+```
+
+```{r scale_regress, eval=FALSE}
+# NOTA: No ejecutado (eval=FALSE).
+# La regresión del efecto mitocondrial no se aplica porque el filtrado previo
+# (< 5% MT) ya ha eliminado las células más estresadas. Aplicarla podría
+# eliminar señal biológica real en células con alta demanda energética legítima.
+seu <- ScaleData(seu, vars.to.regress = 'percent.MT')
+```
+
+***
+
+# Reducción dimensional lineal (PCA)
+
+El PCA reduce la alta dimensionalidad del dataset (miles de genes) a un conjunto de componentes principales (PCs), cada una de las cuales es una combinación lineal de genes que explica la mayor fuente de variación entre células. Los primeros PCs capturan las diferencias biológicas entre grandes linajes celulares.
+
+
+```{r pca, results='hide'}
+seu <- RunPCA(seu, features = VariableFeatures(object = seu))
+```
+
+```{r pca_viz, fig.height=8, fig.width=10, message=TRUE}
+print(seu[['pca']], dims = 1:5, nfeatures = 5)
+VizDimLoadings(seu, dims = 1:2, reduction = 'pca')
+```
+
+`VizDimLoadings` muestra los genes con mayor contribución (loadings) a los dos primeros componentes principales. En muestras de sangre, el PC1 suele separar el linaje mieloide (monocitos/células dendríticas, caracterizados por genes como S100A8, LYZ) del linaje linfoide (linfocitos T, B y NK, con genes como IL7R, CD3D). El PC2 típicamente separa subpoblaciones dentro del linaje linfoide.
+
+```{r pca_dimplot}
+DimPlot(seu, reduction = 'pca') + NoLegend()
+```
+
+En este mapa PCA, los puntos no están coloreados por tipo celular conocido, sino que reflejan la estructura emergente de los datos. La aparición de trayectorias o "brazos" claramente diferenciados confirma que la variabilidad capturada tiene una base biológica real (separación de linajes) y no es aleatoria. La forma característica de "T invertida" es frecuente en muestras de sangre periférica. Si los puntos forman una nube caótica sin estructura, indicaría un problema en pasos previos.
+
+
+```{r single_heatmap, fig.height=6, fig.width=9}
+DimHeatmap(seu, dims = 1, cells = 500, balanced = TRUE)
+```
+
+```{r multi_heatmap, fig.height=15, fig.width=9}
+DimHeatmap(seu, dims = 1:15, cells = 500, balanced = TRUE)
+```
+
+El `DimHeatmap` visualiza la heterogeneidad celular capturada por cada PC. Las células (columnas) y los genes (filas) se ordenan según su puntuación en la PC correspondiente. Un bloque amarillo (alta expresión) contrastando con un bloque morado (baja expresión) indica que esa PC separa claramente dos perfiles transcripcionales distintos. Los PCs con patrón de contraste débil o difuso aportan menos información biológica y pueden excluirse del análisis posterior.
+
+***
+
+# Dimensionalidad del dataset (ElbowPlot)
+
+Para el clustering y la reducción no lineal (UMAP) es necesario seleccionar el número de PCs a utilizar. Incluir demasiados PCs introduce ruido técnico; incluir muy pocos puede colapsar subpoblaciones biológicamente distintas.
+
+> **⚠️ Nota:** El parámetro `dims_use` **debe ajustarse individualmente por muestra** tras inspeccionar el ElbowPlot. Sin embargo, para garantizar la reproducibilidad del protocolo y la comparabilidad entre muestras en el análisis integrado, **se fija `dims_use = 1:15` como estándar del pipeline**, en línea con los parámetros utilizados en scDblFinder  Modificar solo si hay una razón biológica o técnica fuerte para hacerlo.
+
+```{r elbow_plot, fig.height=6, fig.width=10}
+ElbowPlot(seu, ndims = 30)
+```
+
+```{r dims_set}
+# ── PARÁMETRO A AJUSTAR POR MUESTRA SI EL ELBOWPLOT LO INDICA ──────────────────
+dims_use <- 1:15   # Estándar del pipeline
+# ────────────────────────────────────────────────────────────────────────────────
+```
+
+***
+
+# Clustering
+
+Se utiliza `clustree` para seleccionar la resolución óptima antes de fijar el clustering definitivo. `clustree` visualiza cómo evolucionan los clusters al aumentar la resolución, permitiendo identificar el punto de estabilidad donde añadir más resolución no crea nuevos clusters biológicamente relevantes sino solo fragmentación de los existentes.
+
+```{r clustree_resolution, fig.height=12, fig.width=10, message=FALSE, warning=FALSE}
+seu <- FindNeighbors(seu, dims = dims_use)
+
+# Calcular clusters a múltiples resoluciones para el análisis con clustree
+seu <- FindClusters(seu, resolution = c(0.2, 0.4, 0.6, 0.8, 1.0, 1.2),
+                       verbose = FALSE)
+
+# Visualizar la estabilidad de los clusters con clustree
+clustree(seu, prefix = "RNA_snn_res.")
+```
+
+`clustree` muestra el árbol de clusters: cada nodo es un cluster a una resolución dada y las flechas indican cómo se subdividen al aumentar la resolución. Se busca el punto donde el árbol se estabiliza (sin ramificaciones nuevas) o donde las flechas dejan de cruzarse entre clusters distintos. Una resolución que genera muchas flechas cruzadas indica inestabilidad.
+
+```{r cluster_final}
+# ── RESOLUCIÓN FIJADA SEGÚN PROTOCOLO (0.8) ─────────────────────────────────────
+# Resolución seleccionada: 0.8 (consenso del equipo, validado con clustree)
+# Modificar si el clustree de esta muestra indica una resolución claramente mejor.
+resolucion_final <- 0.8
+# ────────────────────────────────────────────────────────────────────────────────
+
+seu <- FindClusters(seu, resolution = resolucion_final, verbose = FALSE)
+cat("Resolución aplicada:", resolucion_final, "\n")
+cat("Número de clusters:", length(unique(seu$seurat_clusters)), "\n")
+```
+
+***
+
+# Reducción dimensional no lineal (UMAP)
+
+```{r umap}
+seu <- RunUMAP(seu, dims = dims_use)
+```
+
+```{r umap_plot, fig.height=8, fig.width=8}
+DimPlot(seu, reduction = 'umap', label = TRUE)
+```
+
+En el mapa UMAP cada punto representa una célula individual. El algoritmo proyecta las células en un espacio bidimensional de forma que las células con perfiles transcripcionales similares aparecen próximas entre sí y las células distintas aparecen separadas. Los colores representan los clusters calculados en el paso anterior. Es importante recordar que las distancias absolutas entre clusters no tienen significado cuantitativo: únicamente la proximidad entre células dentro de un mismo cluster es biológicamente interpretable.
+
+```{r save_umap_prelim, eval=TRUE}
+saveRDS(seu, file = ruta_rds_general)
+```
+
+***
+
+# Marcadores diferenciales por cluster (cluster biomarkers)
+
+Se buscan los biomarcadores (genes) que definen a cada cluster mediante análisis de expresión diferencial: para cada cluster, se compara su expresión génica frente al resto de células del dataset.
+
+```{r markers}
+seu <- JoinLayers(seu)
+
+n_clusters <- length(unique(seu@meta.data$seurat_clusters))
+
+if (n_clusters > 1) {
+  seu_markers <- FindAllMarkers(seu, only.pos = TRUE,
+                                   min.pct = 0.25, logfc.threshold = 0.25,
+                                   max.cells.per.ident = 200)
+
+  seu_markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_max(n = 3, order_by = avg_log2FC) %>%
+    knitr::kable()
+
+} else {
+  message("Solo hay 1 cluster en esta muestra — FindAllMarkers no es aplicable.")
+}
+```
+
+La tabla muestra los 3 marcadores más diferencialmente expresados por cluster:
+
+- **p_val:** p-valor del test de Wilcoxon; cuanto más pequeño, más significativo.
+- **p_val_adj:** p-valor ajustado por corrección de Bonferroni para comparaciones múltiples.
+- **avg_log2FC:** log2 fold-change medio; indica cuánto más se expresa este gen en este cluster respecto al resto.
+- **pct.1:** porcentaje de células de este cluster que expresan el gen.
+- **pct.2:** porcentaje de células del resto de clusters que expresan el gen.
+
+Un buen marcador de cluster tiene p_val_adj < 0.05, avg_log2FC alto, pct.1 alto y pct.2 bajo.
+
+
+```{r feature_plots_general, fig.height=8, fig.width=10}
+FeaturePlot(seu, features = c("S100A8", "CST3", "IL7R", "CD8A", "GZMA", "MS4A1",
+                                  "TNFRSF17", "TRDC", "CD34"), ncol = 3)
+```
+
+```{r feature_plots_myeloid, fig.height=5, fig.width=10}
+FeaturePlot(seu, features = c("S100A8", "LYZ", "CST3", "FCER1A", "IRF7", "TCF4"), ncol = 3)
+```
+
+```{r feature_plots_T, fig.height=5, fig.width=10}
+FeaturePlot(seu, features = c("CD3E", "IL7R", "CD8A", "TRDC"), ncol = 2)
+```
+
+```{r feature_plots_B_NK, fig.height=5, fig.width=12}
+FeaturePlot(seu, features = c("MS4A1", "CD79A", "TNFRSF17", "MZB1", "GZMA", "NKG7"), ncol = 3)
+```
+
+```{r feature_plots_progenitors, fig.height=5, fig.width=5}
+FeaturePlot(seu, features = c("CD34"))
+```
+
+El `FeaturePlot` proyecta la expresión de un gen directamente sobre el mapa UMAP, permitiendo identificar visualmente en qué clusters se expresa cada marcador. 
+
+Marcadores de referencia para la interpretación manual:
+
+Marcadores                       | Tipo celular
+---------------------------------|----------------------------
+S100A8, LYZ, CST3                | Monocitos clásicos
+CST3, FCER1A, IRF7, TCF4         | Células dendríticas (cDCs)
+IL7R, CD3E, CD3D                 | Linfocitos T CD4+
+CD3E, CD3D, CD8A, CD8B           | Linfocitos T CD8+
+CD3E, CD3D, TRDC                 | Linfocitos T γδ
+GZMA, GZMB, GZMH, NKG7           | Células NK
+MS4A1, CD79A                     | Linfocitos B
+CD79A, TNFRSF17, MZB1            | Células plasmáticas
+CD34                             | HSPCs (progenitores)
+
+***
+
+# Anotación automática de tipos celulares
+
+## SingleR — Monaco Immune Data
+
+Se utiliza el paquete SingleR con la base de datos de referencia **MonacoImmuneData** (Monaco et al., *Cell Reports*, 2019; GSE107011) para la anotación automática de clusters. Esta referencia, construida a partir de 114 muestras bulk RNA-seq de poblaciones inmunes humanas purificadas por citometría de flujo, es la más apropiada para muestras de sangre periférica con foco en el sistema inmune. Ofrece 29 subtipos celulares finos (`label.fine`), incluyendo subpoblaciones de especial interés para este proyecto: *T regulatory cells*, *Naive CD4 T cells*, *Follicular helper T cells*, linfocitos T γδ (*Vd2* y *Non-Vd2*) y *Plasmacytoid dendritic cells*, entre otros.
+
+> **Limitación:** Referencia generada con adultos sanos. En sangre neonatal, la confianza de algunas anotaciones (especialmente células NK inmaduras y progenitores) puede ser menor. Validar siempre con los FeaturePlots del apartado anterior.
+
+```{r singler_annotation, fig.height=14, fig.width=11}
+ref.monaco <- MonacoImmuneData()
+
+datos_sample <- GetAssayData(seu, assay = "RNA", layer = "data")
+
+predictions.monaco <- SingleR(test   = datos_sample,
+                               ref    = ref.monaco,
+                               labels = ref.monaco$label.fine)
+
+seu[["SingleR.Monaco"]] <- predictions.monaco$labels
+
+DimPlot(seu, reduction = 'umap', group.by = "SingleR.Monaco",
+        label = TRUE, label.size = 3.5, repel = TRUE) +
+  ggtitle("Anotación Automática — Monaco Immune Data (label.fine)") +
+  theme(plot.title = element_text(hjust = 0.5, size = 13),
+        legend.position = "bottom",
+        legend.text = element_text(size = 10)) +
+  guides(color = guide_legend(ncol = 5, override.aes = list(size = 3)))
+```
+
+## Matriz de asignación celular (Monaco)
+
+La matriz de scores muestra la confianza de SingleR para cada tipo celular en cada célula. Valores altos en una única categoría indican anotaciones robustas; valores similares en varias categorías indican ambigüedad. Las células con score máximo bajo (`max.score`) deben revisarse manualmente.
+
+```{r singler_scores_monaco}
+# Extraer scores de Monaco y añadir a metadatos
+scores_monaco <- as.data.frame(predictions.monaco$scores)
+colnames(scores_monaco) <- paste0("Monaco_score_", colnames(scores_monaco))
+seu <- AddMetaData(seu, metadata = scores_monaco)
+
+# Tabla resumen: score máximo y tipo asignado por cluster
+resumen_monaco <- seu@meta.data %>%
+  group_by(seurat_clusters, SingleR.Monaco) %>%
+  summarise(n_celulas = n(), .groups = "drop") %>%
+  group_by(seurat_clusters) %>%
+  slice_max(n_celulas, n = 1) %>%
+  arrange(seurat_clusters)
+
+cat("Asignación mayoritaria por cluster (Monaco):\n")
+print(resumen_monaco)
+
+# Heatmap de scores por cluster (media de scores por tipo celular y cluster)
+score_cols <- grep("Monaco_score_", colnames(seu@meta.data), value = TRUE)
+scores_cluster <- seu@meta.data %>%
+  select(seurat_clusters, all_of(score_cols)) %>%
+  group_by(seurat_clusters) %>%
+  summarise(across(everything(), mean), .groups = "drop")
+
+cat("\nMedia de scores por cluster disponible en 'scores_cluster'\n")
+```
+
+```{r singler_delta_monaco, fig.height=6, fig.width=10}
+# Delta score: diferencia entre el mejor y segundo mejor score
+# Un delta bajo indica anotación ambigua
+plotScoreHeatmap(predictions.monaco,
+                 show.pruned = TRUE,
+                 annotation_col = data.frame(
+                   Cluster = seu$seurat_clusters,
+                   row.names = colnames(seu)))
+```
+
+```{r save_umap_annotated_monaco, include=TRUE}
+nombre_archivo <- paste0(ruta_imagenes, "UMAP_", nombre_muestra, "_Monaco.png")
+
+plot_monaco <- DimPlot(seu, reduction = 'umap', group.by = "SingleR.Monaco",
+        label = TRUE, label.size = 3, repel = TRUE) +
+  ggtitle("Anotación Automática — Monaco Immune Data (label.fine)") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom",
+        legend.text = element_text(size = 10)) +
+  guides(color = guide_legend(ncol = 4, override.aes = list(size = 3)))
+
+ggsave(filename = nombre_archivo, height = 13, width = 11, plot = plot_monaco, dpi = 300)
+```
+
+***
+
+## SingleR — Human Primary Cell Atlas
+
+Como referencia comparativa, se repite la anotación automática utilizando el **Human Primary Cell Atlas** (HPCA), una referencia de propósito general construida a partir de tejidos primarios humanos diversos. A diferencia de MonacoImmuneData, el HPCA ofrece menor resolución en subpoblaciones inmunes (`label.main` con ~20 tipos celulares principales), pero permite validar que las grandes identidades de linaje asignadas por Monaco son consistentes entre referencias independientes.
+
+```{r singler_hca, fig.height=14, fig.width=11}
+ref.hca <- HumanPrimaryCellAtlasData()
+
+predictions.hca <- SingleR(test   = datos_sample,
+                            ref    = ref.hca,
+                            labels = ref.hca$label.main)
+
+seu[["SingleR.HCA"]] <- predictions.hca$labels
+
+DimPlot(seu, reduction = 'umap', group.by = "SingleR.HCA",
+        label = TRUE, label.size = 3, pt.size = 0.5, repel = TRUE) +
+  NoLegend() +
+  ggtitle("Anotación Comparativa — Human Primary Cell Atlas (label.main)") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom",
+        legend.text = element_text(size = 9)) +
+  guides(color = guide_legend(ncol = 4, override.aes = list(size = 3)))
+```
+
+### Concordancia Monaco vs HCA por cluster
+
+```{r concordancia_singler}
+concordancia <- seu@meta.data %>%
+  select(seurat_clusters, SingleR.Monaco, SingleR.HCA) %>%
+  group_by(seurat_clusters, SingleR.Monaco, SingleR.HCA) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(seurat_clusters) %>%
+  slice_max(n, n = 1) %>%
+  arrange(seurat_clusters)
+
+cat("Concordancia Monaco vs HCA por cluster:\n")
+print(concordancia)
+```
+
+Una concordancia alta entre ambas referencias (Monaco y HPCA) en las identidades de linaje principal — linfocitos T, linfocitos B, monocitos, células NK — refuerza la robustez de la anotación automática. Las discrepancias, si las hay, suelen aparecer en subpoblaciones raras o en células con transcriptomas intermedios, y deben resolverse mediante la inspección manual de los FeaturePlots de marcadores canónicos del apartado anterior.
+
+### Concordancia Monaco vs HCA — tabla comparativa
+
+```{r anotacion_comparativa}
+# Tabla consolidada: Monaco y HCA por cluster
+tabla_comparativa <- seu@meta.data %>%
+  select(seurat_clusters, SingleR.Monaco, SingleR.HCA) %>%
+  group_by(seurat_clusters) %>%
+  summarise(
+    Monaco_mayoritario = names(sort(table(SingleR.Monaco), decreasing = TRUE))[1],
+    HCA_mayoritario    = names(sort(table(SingleR.HCA),    decreasing = TRUE))[1],
+    n_celulas          = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(seurat_clusters)
+
+cat("Tabla comparativa Monaco vs HCA por cluster:\n")
+print(tabla_comparativa)
+
+# Exportar tabla comparativa
+write.csv(tabla_comparativa, file = ruta_csv_anotacion, row.names = FALSE)
+```
+
+Esta tabla consolida las anotaciones de Monaco y HCA por cluster. Una concordancia alta en las identidades de linaje principal (linfocitos T, B, monocitos, NK) refuerza la robustez de la anotación. Las discrepancias deben resolverse con la inspección manual de los FeaturePlots de marcadores canónicos.
+
+***
+
+# Control de calidad — Post-filtrado
+
+Visualización de las métricas de calidad tras todo el preprocesamiento para verificar que el filtrado ha sido efectivo y que no quedan clusters con características técnicas anómalas.
+
+```{r qc_violin_post, fig.height=7, fig.width=13}
+plot_genes2  <- VlnPlot(seu, features = "nFeature_RNA", pt.size = 0) + ylim(0, 10000) + NoLegend()
+plot_counts2 <- VlnPlot(seu, features = "nCount_RNA",   pt.size = 0) + ylim(0, 50000) + NoLegend()
+plot_mito2   <- VlnPlot(seu, features = "percent.MT",   pt.size = 0) + ylim(0, 25)    + NoLegend()
+
+plot_genes2 | plot_counts2 | plot_mito2
+```
+
+Comparar este resultado con el gráfico pre-filtrado:
+- **nFeature_RNA y nCount_RNA:** Los violines deben presentar distribuciones similares entre clusters, sin grupos con anchos extremos en valores muy bajos ni muy altos. Diferencias marcadas entre clusters en estas métricas pueden indicar artefactos técnicos más que diferencias biológicas.
+- **percent.MT:** Todos los violines deben estar concentrados cerca del 0%. La presencia de algún cluster con valores elevados podría indicar que se han agrupado células estresadas o en apoptosis que superaron el umbral de filtrado; este cluster debería examinarse con cautela.
+
+
+```{r qc_hbb_post, fig.height=5, fig.width=13}
+plot_hbb2     <- VlnPlot(seu, features = "HBB", pt.size = 0) + NoLegend()
+feat_hbb_filt <- FeaturePlot(seu, features = "HBB") +
+  ggtitle("HBB UMAP — Postfiltrado de eritrocitos")
+
+plot_hbb2 | feat_hbb_filt
+```
+
+- **HBB:**  el violín debe estar completamente pegado al 0 y el FeaturePlot debe mostrar el UMAP en gris uniforme (sin células con expresión detectada). Si todavía aparecen células con HBB > 0, puede indicar que el umbral HBB < 1 fue demasiado permisivo para esta muestra concreta y habría que bajarlo, o bien que hay contaminación por ARN ambiental que requeriría un paso adicional de limpieza con SoupX antes del preprocesamiento.**
+
+
+
+```{r qc_scatter_post, fig.height=7, fig.width=13}
+plot1.2 <- FeatureScatter(seu, feature1 = "nCount_RNA", feature2 = "percent.MT",
+                          group.by = "orig.ident", cols = "darkgray")
+plot2.2 <- FeatureScatter(seu, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",
+                          group.by = "orig.ident", cols = "darkgray")
+
+plot1.2 <- plot1.2 + geom_smooth(method = "lm", color = "red")
+plot2.2 <- plot2.2 + geom_smooth(method = "lm", color = "red")
+
+plot1.2 + plot2.2
+```
+
+- **Lecturas vs Mitocondrias:** La nube debe ser plana y difusa, concentrada en la franja 0–3% de percent.MT. La línea de tendencia debe ser prácticamente horizontal (r ≈ 0), confirmando la independencia entre profundidad de secuenciación y estrés celular.
+- **Lecturas vs Genes:** Nube diagonal ascendente densa (r cercano a 1). La dispersión residual es biológicamente normal: células con el mismo número de lecturas pueden detectar más o menos genes dependiendo de su tipo celular. Los límites del filtrado (200–5000 genes) deben ser visibles como cortes en los extremos de la nube.
+
+***
+
+```{r, scDblFinder}
+library(scDblFinder)
+library(SingleCellExperiment)
+
+# Conversión: pasar counts + clustering de Seurat a scDblFinder
+# No se convierte el objeto completo — solo se pasan los counts y los cluster IDs,
+# lo que es más eficiente en RAM que convertir el objeto Seurat entero a SCE.
+set.seed(123)
+sce_dbl <- scDblFinder(
+  GetAssayData(seu, assay = "RNA", layer = "counts"),
+  clusters = Idents(seu)
+)
+
+# Portar scores y clasificación de vuelta al objeto Seurat
+seu$scDblFinder.score <- sce_dbl$scDblFinder.score
+seu$scDblFinder.class <- sce_dbl$scDblFinder.class
+
+cat("Distribución doublets/singlets:\n")
+print(table(seu$scDblFinder.class))
+
+
+
+# Liberar el SCE temporal
+rm(sce_dbl)
+gc()
+```
+
+```{r plotdoublet}
+p1 <- DimPlot(seu, reduction = "umap",
+              group.by = "scDblFinder.class",
+              cols = c("doublet" = "red", "singlet" = "lightgray"),
+              pt.size = 0.5) +
+      ggtitle(paste("scDblFinder —", nombre_muestra))
+
+p2 <- FeaturePlot(seu, features = "scDblFinder.score") +
+      scale_colour_gradientn(colours = c("lightgray", "orange", "red")) +
+      ggtitle("Score scDblFinder")
+
+print(p1 | p2)
+```
+
+```{r filter_doublet}
+# Diagnóstico: distribución del score (debe ser bimodal, picos cerca de 0 y de 1)
+hist(seu$scDblFinder.score, breaks = 50,
+     main = paste("Distribución score scDblFinder —", nombre_muestra),
+     xlab = "scDblFinder score", col = "steelblue")
+
+# Filtrado: conservar solo singlets
+n_antes <- ncol(seu)
+seu <- subset(seu, subset = scDblFinder.class == "singlet")
+n_post_doublets <- ncol(seu)  
+cat("Eliminados como doublets:", n_antes - ncol(seu), "\n")
+cat("Células conservadas:     ", ncol(seu), "\n")
+```
+
+# Resumen final de células por paso
+
+```{r cell_counts_final}
+
+cat("── DIAGNÓSTICO DE CÉLULAS POR PASO ───────────────────────────\n")
+cat("Tras CreateSeuratObject:          ", n_post_create,                          
+    "| Eliminadas:", n_post_create  - n_post_qc,      "\n")
+cat("Tras filtro QC (MT + nFeature):   ", n_post_qc,                              
+    "| Eliminadas:", n_post_qc      - n_post_eritro,  "\n")
+cat("Tras filtrado de eritrocitos:     ", n_post_eritro,                           
+    "| Eliminadas:", n_post_eritro  - n_post_doublets,"\n")
+cat("Tras filtrado de doublets:        ", n_post_doublets,                         
+    "| Eliminadas:", n_antes        - n_post_doublets,"\n")
+cat("──────────────────────────────────────────────────────────────\n")
+cat("Total células eliminadas:         ", n_post_create - n_post_doublets, "\n")
+cat("Porcentaje conservado:            ", 
+    round(n_post_doublets / n_post_create * 100, 1), "%\n")
+cat("──────────────────────────────────────────────────────────────\n")
+```
+
+***
+
+# Final save
+
+```{r save_final}
+saveRDS(seu, file = ruta_rds_final)
+cat("Objeto final guardado en:", ruta_rds_final, "\n")
+```
+
+El objeto Seurat guardado contiene todas las células que han superado los filtros de calidad (QC estándar, eritrocitos y doublets), con el preprocesamiento completo aplicado:
+*SoupX → normalización → genes variables → escalado → PCA → UMAP → clustering → anotación con Monaco y HCA.*
+Este objeto está listo para integrarse con el resto de muestras mediante Harmony.
+
+```{r resumen_qc}
+resumen <- data.frame(
+  Muestra               = nombre_muestra,
+  Celulas_postCreate    = n_post_create,
+  Celulas_postQC        = n_post_qc,
+  Celulas_postEritro    = n_post_eritro,
+  Celulas_postDoublets  = n_post_doublets,
+  Pct_conservado        = round(n_post_doublets / n_post_create * 100, 1),
+  Genes_mediana         = median(seu@meta.data$nFeature_RNA),
+  UMIs_mediana          = median(seu@meta.data$nCount_RNA),
+  MT_mediana            = round(median(seu@meta.data$percent.MT), 2),
+  N_clusters            = length(unique(seu@meta.data$seurat_clusters)),
+  SoupX_rho             = ifelse(exists("sc") && is.numeric(sc$fit$rho), 
+                                 round(sc$fit$rho, 4), NA)
+)
+
+print(resumen)
+
+write.csv(resumen, file = ruta_csv_resumen, row.names = FALSE)
+cat("CSV resumen guardado en:", ruta_csv_resumen, "\n")
+```
+
+```{r export_pdf_violines}
+# PDF con violines pre y post filtrado
+ruta_pdf_vln <- paste0(ruta_imagenes, "PDF_violines_", nombre_muestra, ".pdf")
+
+pdf(ruta_pdf_vln, width = 13, height = 7)
+
+# Panel PRE-filtrado (usar los objetos guardados previamente)
+print((plot_genes  | plot_counts  | plot_mito  | plot_hbb)  + 
+        plot_annotation(title = paste("Violines PRE-filtrado —", nombre_muestra)))
+
+# Panel POST-filtrado
+print((plot_genes2 | plot_counts2 | plot_mito2) + 
+        plot_annotation(title = paste("Violines POST-filtrado —", nombre_muestra)))
+
+# HBB post-filtrado
+print(plot_hbb2 | feat_hbb_filt)
+
+dev.off()
+cat("PDF violines guardado en:", ruta_pdf_vln, "\n")
+```
+
+```{r export_pdf_umaps}
+# PDF con UMAPs principales
+ruta_pdf_umap <- paste0(ruta_imagenes, "PDF_umaps_", nombre_muestra, ".pdf")
+
+pdf(ruta_pdf_umap, width = 11, height = 9)
+
+# UMAP con clusters Seurat
+print(DimPlot(seu, reduction = "umap", label = TRUE) +
+        ggtitle(paste("UMAP clusters —", nombre_muestra)))
+
+# UMAP con anotación Monaco
+print(plot_monaco)
+
+# UMAP con anotación HCA
+print(DimPlot(seu, reduction = "umap", group.by = "SingleR.HCA",
+              label = TRUE, label.size = 3, pt.size = 0.5, repel = TRUE) +
+        NoLegend() +
+        ggtitle(paste("UMAP HCA —", nombre_muestra)))
+
+# DoubletFinder (si se ejecutó)
+print(p1 | p2) +
+        ggtitle(paste("scDblFinder", nombre_muestra))
+
+dev.off()
+cat("PDF UMAPs guardado en:", ruta_pdf_umap, "\n")
+```

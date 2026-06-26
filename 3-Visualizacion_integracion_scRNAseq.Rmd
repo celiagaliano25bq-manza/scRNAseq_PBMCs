@@ -1,0 +1,1107 @@
+---
+title: "Visualización — scRNA-seq Integrado"
+subtitle: "Control vs HI · Harmony · 7 muestras"
+author: "Celia Galiano Manzanares"
+date: '`r format(Sys.Date(), "%d de %B de %Y")`'
+output:
+  html_document:
+    theme: united
+    df_print: kable
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy      = TRUE,
+  tidy.opts = list(width.cutoff = 95),
+  message   = FALSE,
+  warning   = FALSE,
+  error     = TRUE,
+  fig.align = "center"
+)
+```
+
+> **Nota de uso:** Este script parte del objeto integrado `seu_integrado_harmony.rds` generado en el script de integración. No reprocesa datos; solo genera figuras y tablas de resultados.
+
+---
+
+## Setup
+
+```{r libraries}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(tidyr)
+library(scales)
+library(RColorBrewer)
+library(viridis)
+library(ggrepel)
+library(tibble) 
+```
+
+```{r init}
+# ── RUTAS ──────────────────────────────────────────────────────────────────────
+ruta_workspace <- "./"
+ruta_out       <- paste0(ruta_workspace, "output/integracion/")
+ruta_figuras   <- paste0(ruta_out, "figuras/")
+ruta_tablas    <- paste0(ruta_out, "tablas/")
+
+for (d in c(ruta_figuras, ruta_tablas)) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+}
+
+# ── PALETAS DE COLOR ───────────────────────────────────────────────────────────
+col_grupo    <- c("Control" = "#4e79a7", "HI" = "#e34459")
+col_fine     <- colorRampPalette(brewer.pal(12, "Paired"))(29)
+col_main     <- brewer.pal(10, "Set2")
+
+cat("Rutas configuradas.\n")
+```
+
+```{r load_object}
+cat("Cargando objeto integrado...\n")
+seu <- readRDS(paste0(ruta_out, "seu_integrado_harmony.rds"))
+
+# Verificar columnas de anotación disponibles
+cat("Columnas de anotación disponibles:\n")
+cat(" -", grep("SingleR", colnames(seu@meta.data), value = TRUE), "\n")
+cat("Células totales: ", ncol(seu), "\n")
+cat("Clusters:        ", length(unique(seu$seurat_clusters)), "\n")
+cat("Muestras:        ", paste(unique(seu$orig.ident), collapse = ", "), "\n")
+```
+
+---
+
+# PANEL A — Control de Calidad
+
+```{r panel_a_qc, fig.height=10, fig.width=14}
+# Violines de QC por muestra, coloreados por grupo
+meta <- seu@meta.data %>%
+  mutate(orig.ident = factor(orig.ident,
+                             levels = c("C1_B3", "C2_B8",
+                                        "HI1_B1", "HI3_B2", "HI4_B4",
+                                        "HI8_B5", "HI9_B6")))
+
+p_genes <- ggplot(meta, aes(x = orig.ident, y = nFeature_RNA, fill = grupo)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  geom_boxplot(width = 0.08, outlier.size = 0.3, fill = "white", alpha = 0.7) +
+  scale_fill_manual(values = col_grupo) +
+  scale_y_continuous(limits = c(0, 6000)) +
+  labs(title = "Genes detectados (nFeature_RNA)",
+       x = NULL, y = "nFeature_RNA", fill = "Condición") +
+  theme_classic() +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1),
+        plot.title   = element_text(size = 11, face = "bold"),
+        legend.position = "none")
+
+p_counts <- ggplot(meta, aes(x = orig.ident, y = nCount_RNA, fill = grupo)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  geom_boxplot(width = 0.08, outlier.size = 0.3, fill = "white", alpha = 0.7) +
+  scale_fill_manual(values = col_grupo) +
+  scale_y_continuous(limits = c(0, 30000), labels = comma) +
+  labs(title = "UMIs totales (nCount_RNA)",
+       x = NULL, y = "nCount_RNA", fill = "Condición") +
+  theme_classic() +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1),
+        plot.title   = element_text(size = 11, face = "bold"),
+        legend.position = "none")
+
+p_mito <- ggplot(meta, aes(x = orig.ident, y = percent.MT, fill = grupo)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  geom_boxplot(width = 0.08, outlier.size = 0.3, fill = "white", alpha = 0.7) +
+  scale_fill_manual(values = col_grupo) +
+  scale_y_continuous(limits = c(0, 6)) +
+  labs(title = "% Mitocondrial (percent.MT)",
+       x = NULL, y = "% MT", fill = "Condición") +
+  theme_classic() +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1),
+        plot.title   = element_text(size = 11, face = "bold"))
+
+# Barplot de células por muestra
+meta <- seu@meta.data
+n_celulas_muestra <- meta %>%
+  count(orig.ident, grupo)
+
+p_ncells <- ggplot(n_celulas_muestra, aes(x = orig.ident, y = n, fill = grupo)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = n), vjust = -0.3, size = 3) +
+  scale_fill_manual(values = col_grupo) +
+  labs(title = "Células por muestra (post-filtrado)",
+       x = NULL, y = "N células", fill = "Condición") +
+  theme_classic() +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1),
+        plot.title   = element_text(size = 11, face = "bold"),
+        legend.position = "none")
+
+panel_A <- (p_ncells | p_genes | p_counts | p_mito) +
+  plot_annotation(
+    title    = "PANEL A — Control de Calidad Post-Filtrado",
+    subtitle = paste0("N = ", ncol(seu), " células · 7 muestras · 2 controles + 5 HI"),
+    theme    = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+print(panel_A)
+ggsave(paste0(ruta_figuras, "Panel_A_QC.png"),
+       plot = panel_A, width = 16, height = 5, dpi = 300)
+```
+
+```{r panel_a_tabla}
+# Tabla resumen QC por muestra
+tabla_qc <- meta %>%
+  group_by(orig.ident, grupo) %>%
+  summarise(
+    N_celulas      = n(),
+    Genes_mediana  = round(median(nFeature_RNA)),
+    Genes_IQR      = paste0(round(quantile(nFeature_RNA, 0.25)), "–",
+                            round(quantile(nFeature_RNA, 0.75))),
+    UMIs_mediana   = round(median(nCount_RNA)),
+    MT_mediana_pct = round(median(percent.MT), 2),
+    .groups = "drop"
+  )
+knitr::kable(tabla_qc, caption = "Resumen QC por muestra (post-filtrado)")
+write.csv(tabla_qc, paste0(ruta_tablas, "tabla_QC_por_muestra.csv"), row.names = FALSE)
+```
+
+---
+
+# PANEL B — UMAP Global
+
+```{r panel_b_umap, fig.height=6, fig.width=16}
+p_b1 <- DimPlot(seu, reduction = "umap", group.by = "seurat_clusters",
+                label = TRUE, label.size = 4, repel = TRUE, raster = T) +
+  ggtitle("Clusters (resolución 0.8)") +
+  theme_void() +
+  theme(plot.title     = element_text(size = 12, face = "bold"),
+        legend.position = "none")
+
+p_b2 <- DimPlot(seu, reduction = "umap", group.by = "orig.ident",
+                raster = T) +
+  ggtitle("Por muestra") +
+  theme_void() +
+  theme(plot.title = element_text(size = 12, face = "bold"))
+
+p_b3 <- DimPlot(seu, reduction = "umap", group.by = "grupo",
+                cols = col_grupo, raster = T) +
+  ggtitle("Por condición (Control vs HI)") +
+  theme_void() +
+  theme(plot.title = element_text(size = 12, face = "bold"))
+
+panel_B <- (p_b1 | p_b2 | p_b3) +
+  plot_annotation(
+    title = "PANEL B — UMAP Global post-Harmony",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+print(panel_B)
+ggsave(paste0(ruta_figuras, "Panel_B_UMAP_Global.png"),
+       plot = panel_B, width = 18, height = 6, dpi = 300)
+```
+
+---
+
+# PANEL C — Anotación Celular
+
+## Anotación nivel general (label.main)
+
+```{r panel_c_main, fig.height=7, fig.width=10}
+p_c_main <- DimPlot(seu, reduction = "umap",
+                    group.by = "SingleR.Monaco.Main",
+                    label = TRUE, label.size = 3.5,
+                    repel = TRUE, raster = T) +
+  ggtitle("Anotación SingleR — Monaco (label.main)") +
+  theme_void() +
+  theme(plot.title      = element_text(size = 12, face = "bold"),
+        legend.position = "bottom",
+        legend.text     = element_text(size = 9)) +
+  guides(color = guide_legend(ncol = 4, override.aes = list(size = 3)))
+
+print(p_c_main)
+```
+
+## Anotación nivel detallado (label.fine)
+
+```{r panel_c_fine, fig.height=8, fig.width=12}
+p_c_fine <- DimPlot(seu, reduction = "umap",
+                    group.by = "SingleR.Monaco.Fine",
+                    label = TRUE, label.size = 2.5,
+                    repel = TRUE, raster = T) +
+  ggtitle("Anotación SingleR — Monaco (label.fine)") +
+  theme_void() +
+  theme(plot.title      = element_text(size = 12, face = "bold"),
+        legend.position = "bottom",
+        legend.text     = element_text(size = 7.5)) +
+  guides(color = guide_legend(ncol = 5, override.aes = list(size = 3)))
+
+print(p_c_fine)
+```
+
+```{r panel_c_combined, fig.height=16, fig.width=12}
+panel_C <- (p_c_main / p_c_fine) +
+  plot_annotation(
+    title = "PANEL C — Anotación Celular Automática (SingleR · Monaco Immune Data)",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+print(panel_C)
+ggsave(paste0(ruta_figuras, "Panel_C_Anotacion.png"),
+       plot = panel_C, width = 12, height = 16, dpi = 300)
+```
+
+```{r panel_c_tabla}
+# Tabla: anotación main y fine mayoritaria por cluster
+tabla_anotacion <- seu@meta.data %>%
+  group_by(seurat_clusters) %>%
+  summarise(
+    N_celulas        = n(),
+    Monaco_Main      = names(sort(table(SingleR.Monaco.Main), decreasing = TRUE))[1],
+    Pct_Main         = round(max(table(SingleR.Monaco.Main)) / n() * 100, 1),
+    Monaco_Fine      = names(sort(table(SingleR.Monaco.Fine), decreasing = TRUE))[1],
+    Pct_Fine         = round(max(table(SingleR.Monaco.Fine)) / n() * 100, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(seurat_clusters)
+
+knitr::kable(tabla_anotacion,
+             caption = "Anotación mayoritaria por cluster (Main y Fine)",
+             col.names = c("Cluster", "N células",
+                           "Monaco Main", "% Main",
+                           "Monaco Fine", "% Fine"))
+write.csv(tabla_anotacion,
+          paste0(ruta_tablas, "tabla_anotacion_por_cluster.csv"),
+          row.names = FALSE)
+```
+
+---
+
+# PANEL D — Condición y Expresión Diferencial
+
+## UMAP por condición
+
+```{r panel_d_umap, fig.height=6, fig.width=14}
+# Split UMAP: Control vs HI en paneles separados para comparación directa
+p_d_split <- DimPlot(seu, reduction = "umap", group.by = "seurat_clusters",
+                     split.by = "grupo", label = TRUE, label.size = 3,
+                     raster = T) +
+  theme_void() +
+  theme(plot.title   = element_text(size = 12, face = "bold"),
+        strip.text   = element_text(size = 12, face = "bold")) +
+  ggtitle("UMAP por condición — clusters")
+
+p_d_grupo <- DimPlot(seu, reduction = "umap", group.by = "grupo",
+                     cols = col_grupo, raster = T) +
+  theme_void() +
+  theme(plot.title = element_text(size = 12, face = "bold")) +
+  ggtitle("Control vs HI")
+
+print(p_d_split)
+print(p_d_grupo)
+
+ggsave(paste0(ruta_figuras, "Panel_D_UMAP_Condicion.png"),
+       plot = p_d_split, width = 14, height = 6, dpi = 300)
+```
+
+## Expresión diferencial global HI vs Control
+
+```{r panel_d_deg_global}
+# Calcular DEGs globales HI vs Control
+Idents(seu) <- "grupo"
+deg_global <- FindMarkers(
+  seu,
+  ident.1         = "HI",
+  ident.2         = "Control",
+  min.pct         = 0.1,
+  logfc.threshold = 0.25,
+  test.use        = "wilcox"
+)
+deg_global$gene      <- rownames(deg_global)
+deg_global$direccion <- ifelse(deg_global$avg_log2FC > 0, "Up en HI", "Down en HI")
+
+# Restaurar identidades
+Idents(seu) <- "seurat_clusters"
+
+write.csv(deg_global,
+          paste0(ruta_tablas, "DEG_global_HI_vs_Control.csv"),
+          row.names = FALSE)
+
+cat("── DEGs globales HI vs Control ─────────────────────────────\n")
+cat("Total DEGs (p_adj < 0.05):  ",
+    sum(deg_global$p_val_adj < 0.05, na.rm = TRUE), "\n")
+cat("  Up en HI (FC > 0):        ",
+    sum(deg_global$p_val_adj < 0.05 & deg_global$avg_log2FC > 0), "\n")
+cat("  Down en HI (FC < 0):      ",
+    sum(deg_global$p_val_adj < 0.05 & deg_global$avg_log2FC < 0), "\n")
+```
+
+```{r panel_d_volcano, fig.height=7, fig.width=9}
+# Volcano plot DEGs globales
+deg_plot <- deg_global %>%
+  mutate(
+    sig       = p_val_adj < 0.05 & abs(avg_log2FC) > 1,
+    color_cat = case_when(
+      p_val_adj < 0.05 & avg_log2FC >  1 ~ "Up en HI",
+      p_val_adj < 0.05 & avg_log2FC < -1 ~ "Down en HI",
+      TRUE                               ~ "NS"
+    ),
+    label_gen = ifelse(sig & abs(avg_log2FC) > 2, gene, NA)
+  )
+
+top_labels <- deg_plot %>%
+  filter(!is.na(label_gen)) %>%
+  slice_max(abs(avg_log2FC), n = 20)
+
+p_volcano <- ggplot(deg_plot, aes(x = avg_log2FC, y = -log10(p_val_adj),
+                                   color = color_cat)) +
+  geom_point(alpha = 0.6, size = 1.2) +
+  geom_text_repel(data = top_labels,
+                  aes(label = gene), size = 3, max.overlaps = 20) +
+  scale_color_manual(values = c("Up en HI"   = "#e34459",
+                                "Down en HI" = "#4e79a7",
+                                "NS"          = "grey70")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = -log10(0.05),  linetype = "dashed", color = "grey40") +
+  labs(title    = "Volcano Plot — DEGs globales HI vs Control",
+       subtitle = "FC > 1 & p_adj < 0.05",
+       x        = "log2 Fold Change (HI / Control)",
+       y        = "-log10(p valor ajustado)",
+       color    = NULL) +
+  theme_classic() +
+  theme(plot.title    = element_text(size = 12, face = "bold"),
+        legend.position = "top")
+
+print(p_volcano)
+ggsave(paste0(ruta_figuras, "Panel_D_Volcano_Global.png"),
+       plot = p_volcano, width = 9, height = 7, dpi = 300)
+```
+
+---
+
+# Barplots de composición celular
+
+## Composición por muestra individual
+
+```{r barplot_por_muestra_main, fig.height=6, fig.width=12}
+# Proporción de cada tipo celular (main) en cada muestra
+comp_muestra_main <- seu@meta.data %>%
+  group_by(orig.ident, grupo, SingleR.Monaco.Main) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(orig.ident) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup() %>%
+  mutate(orig.ident = factor(orig.ident,
+                             levels = c("C1_B3", "C2_B8",
+                                        "HI1_B1", "HI3_B2", "HI4_B4",
+                                        "HI8_B5", "HI9_B6")))
+
+# 1. Averiguamos exactamente cuántos tipos celulares principales te han salido
+tipos_celulares <- unique(comp_muestra_main$SingleR.Monaco.Main)
+num_tipos <- length(tipos_celulares)
+
+# 2. Fabricamos una paleta a medida 
+
+col_main_dinamico <- colorRampPalette(brewer.pal(8, "Set2"))(num_tipos)
+
+# 3. Dibujamos la gráfica 
+p_comp_muestra_main <- ggplot(comp_muestra_main,
+       aes(x = orig.ident, y = pct, fill = SingleR.Monaco.Main)) +
+  geom_bar(stat = "identity", position = "stack", color = "white", linewidth = 0.2) +
+  geom_text(aes(label = ifelse(pct > 3, paste0(round(pct, 1), "%"), "")),
+            position = position_stack(vjust = 0.5), 
+            size = 3, fontface = "bold", color = "black") +
+  
+  scale_fill_manual(values = setNames(col_main_dinamico, tipos_celulares)) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  
+  # Usamos nuestra paleta dinámica que ahora tiene exactamente el mismo tamaño que tus tipos celulares
+  scale_fill_manual(values = setNames(col_main_dinamico, tipos_celulares)) +
+  
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(title    = "Composición celular por muestra — Monaco Main",
+       subtitle = "Cada barra = una muestra; colores = tipo celular",
+       x = NULL, y = "% células", fill = "Tipo celular") +
+  theme_classic() +
+  theme(axis.text.x      = element_text(angle = 45, hjust = 1),
+        plot.title       = element_text(size = 12, face = "bold"),
+        legend.key.size  = unit(0.4, "cm"),
+        legend.text      = element_text(size = 9))
+
+# Mostramos la gráfica
+print(p_comp_muestra_main)
+
+
+```
+
+```{r barplot_por_muestra_fine, fig.height=7, fig.width=14}
+comp_muestra_fine <- seu@meta.data %>%
+  group_by(orig.ident, grupo, SingleR.Monaco.Fine) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(orig.ident) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup() %>%
+  mutate(orig.ident = factor(orig.ident,
+                             levels = c("C1_B3", "C2_B8",
+                                        "HI1_B1", "HI3_B2", "HI4_B4",
+                                        "HI8_B5", "HI9_B6")))
+
+p_comp_muestra_fine <- ggplot(comp_muestra_fine,
+       aes(x = orig.ident, y = pct, fill = SingleR.Monaco.Fine)) +
+  geom_bar(stat = "identity", position = "stack", color = "white", linewidth = 0.2) +
+  geom_text(aes(label = ifelse(pct > 3, paste0(round(pct, 1), "%"), "")),
+            position = position_stack(vjust = 0.5), 
+            size = 3, fontface = "bold", color = "black") +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  scale_fill_manual(values = setNames(col_fine,
+                                      unique(comp_muestra_fine$SingleR.Monaco.Fine))) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(title    = "Composición celular por muestra — Monaco Fine",
+       subtitle = "Cada barra = una muestra; colores = subtipo celular",
+       x = NULL, y = "% células", fill = "Subtipo celular") +
+  theme_classic() +
+  theme(axis.text.x     = element_text(angle = 45, hjust = 1),
+        plot.title       = element_text(size = 12, face = "bold"),
+        legend.key.size  = unit(0.35, "cm"),
+        legend.text      = element_text(size = 7.5))
+
+print(p_comp_muestra_fine)
+```
+
+```{r barplot_muestra_combinado, fig.height=13, fig.width=14}
+panel_comp_muestra <- (p_comp_muestra_main / p_comp_muestra_fine) +
+  plot_annotation(
+    title = "Composición celular por muestra (Main y Fine)",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+print(panel_comp_muestra)
+ggsave(paste0(ruta_figuras, "Barplot_Composicion_por_Muestra.png"),
+       plot = panel_comp_muestra, width = 14, height = 13, dpi = 300)
+```
+
+##Barplots de composiciḉon celular control vs HI
+
+```{r barplot_comparativa_larga, fig.height=14, fig.width=16}
+# 1. Calcular proporción de cada subtipo celular (Fine) agrupando por Condición
+comp_condicion_fine_stack <- seu@meta.data %>%
+  # Agrupamos por grupo en lugar de por orig.ident
+  group_by(grupo, SingleR.Monaco.Fine) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  # Calculamos el porcentaje sobre el total de cada grupo
+  group_by(grupo) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup() %>%
+  # Aseguramos que Control vaya siempre antes que HI en la gráfica
+  mutate(grupo = factor(grupo, levels = c("Control", "HI")))
+
+# 2. Dibujar la gráfica de barras apiladas con barras más finas
+p_comp_condicion_fine_stack <- ggplot(comp_condicion_fine_stack,
+       aes(x = grupo, y = pct, fill = SingleR.Monaco.Fine)) +
+  
+  # EL TRUCO: width = 0.5 o 0.4 para hacerlas más estrechas y elegantes
+  geom_bar(stat = "identity", position = "stack", color = "white", linewidth = 0.2, width = 0.5) +
+  
+  geom_text(aes(label = ifelse(pct > 3, paste0(round(pct, 1), "%"), "")),
+            position = position_stack(vjust = 0.5), 
+            size = 3.5, fontface = "bold", color = "black") +
+            
+  scale_fill_manual(values = setNames(col_fine,
+                                      unique(comp_condicion_fine_stack$SingleR.Monaco.Fine))) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(title    = "Composición celular por condición — Monaco Fine",
+       subtitle = "Cada barra = una condición; colores = subtipo celular (>3% mostrado)",
+       x = "Condición", y = "% células", fill = "Subtipo celular") +
+  theme_classic() +
+  theme(axis.text.x      = element_text(size = 12, face = "bold"),
+        plot.title       = element_text(size = 14, face = "bold"),
+        # LEYENDA MEJORADA: Letra más grande y cuadrados más visibles
+        legend.key.size  = unit(0.5, "cm"),
+        legend.text      = element_text(size = 9))
+
+print(p_comp_condicion_fine_stack)
+
+# Guardar la gráfica si quieres
+ggsave(paste0(ruta_figuras, "Composicion_Condicion_Apilada_Fine.png"),
+       plot = p_comp_condicion_fine_stack, width = 8, height = 10, dpi = 300)
+```
+
+
+
+## Composición Control vs HI (media de grupo)
+
+```{r barplot_grupo_main, fig.height=6, fig.width=9}
+# Proporción media por grupo: se calcula primero por muestra, luego se promedia
+# Así cada muestra pesa igual, sin sesgo por tamaño
+comp_grupo_main <- seu@meta.data %>%
+  group_by(orig.ident, grupo, SingleR.Monaco.Main) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(orig.ident) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  group_by(grupo, SingleR.Monaco.Main) %>%
+  summarise(pct_media = mean(pct), pct_sd = sd(pct), .groups = "drop")
+
+p_grupo_main <- ggplot(comp_grupo_main,
+       aes(x = reorder(SingleR.Monaco.Main, -pct_media),
+           y = pct_media, fill = grupo)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8),
+           width = 0.7) +
+  geom_errorbar(aes(ymin = pct_media - pct_sd,
+                    ymax = pct_media + pct_sd),
+                position = position_dodge(width = 0.8), width = 0.25) +
+  scale_fill_manual(values = col_grupo) +
+  labs(title    = "Composición celular: Control vs HI — Monaco Main",
+       subtitle = "Media ± SD por muestra de cada grupo",
+       x = NULL, y = "% células (media)", fill = "Condición") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title  = element_text(size = 12, face = "bold"))
+
+print(p_grupo_main)
+```
+
+```{r barplot_grupo_fine, fig.height=7, fig.width=14}
+comp_grupo_fine <- seu@meta.data %>%
+  group_by(orig.ident, grupo, SingleR.Monaco.Fine) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(orig.ident) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  group_by(grupo, SingleR.Monaco.Fine) %>%
+  summarise(pct_media = mean(pct), pct_sd = sd(pct), .groups = "drop")
+
+# Filtrar los top 20 tipos más abundantes para legibilidad
+top_tipos_fine <- comp_grupo_fine %>%
+  group_by(SingleR.Monaco.Fine) %>%
+  summarise(total = sum(pct_media)) %>%
+  slice_max(total, n = 20) %>%
+  pull(SingleR.Monaco.Fine)
+
+p_grupo_fine <- comp_grupo_fine %>%
+  filter(SingleR.Monaco.Fine %in% top_tipos_fine) %>%
+  ggplot(aes(x = reorder(SingleR.Monaco.Fine, -pct_media),
+             y = pct_media, fill = grupo)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8),
+           width = 0.7) +
+  geom_errorbar(aes(ymin = pct_media - pct_sd,
+                    ymax = pct_media + pct_sd),
+                position = position_dodge(width = 0.8), width = 0.25) +
+  scale_fill_manual(values = col_grupo) +
+  labs(title    = "Composición celular: Control vs HI — Monaco Fine (Top 20)",
+       subtitle = "Media ± SD por muestra de cada grupo",
+       x = NULL, y = "% células (media)", fill = "Condición") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        plot.title  = element_text(size = 12, face = "bold"))
+
+print(p_grupo_fine)
+```
+
+```{r barplot_grupo_combinado, fig.height=13, fig.width=14}
+panel_comp_grupo <- (p_grupo_main / p_grupo_fine) +
+  plot_annotation(
+    title = "Composición celular Control vs HI (Main y Fine)",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+print(panel_comp_grupo)
+ggsave(paste0(ruta_figuras, "Barplot_Composicion_Control_vs_HI.png"),
+       plot = panel_comp_grupo, width = 14, height = 13, dpi = 300)
+```
+
+---
+
+# Heatmap — Marcadores por cluster (FindAllMarkers)
+
+Top 5 genes upregulated con FC > 2 por cluster.
+
+```{r heatmap_markers_cluster}
+# Recalcular marcadores (o cargar si ya los tienes guardados)
+# Si markers_integrated ya existe en el entorno, comentar este bloque
+seu <- JoinLayers(seu)
+Idents(seu) <- "seurat_clusters"
+
+markers_cluster <- FindAllMarkers(
+  seu,
+  only.pos        = TRUE,
+  min.pct         = 0.1,
+  logfc.threshold = log2(1.5),   
+  test.use        = "MAST",
+  max.cells.per.ident = 2000,
+  verbose         = FALSE
+)
+
+write.csv(markers_cluster,
+          paste0(ruta_tablas, "markers_por_cluster_FC2.csv"),
+          row.names = FALSE)
+
+cat("Genes con FC > 2 encontrados:", nrow(markers_cluster), "\n")
+```
+
+```{r heatmap_cluster_top5, fig.height=12, fig.width=14}
+# Top 5 por cluster ordenados por avg_log2FC
+# Necesario para rownames_to_column
+
+# Top 5 por cluster ordenados por avg_log2FC
+top5_cluster <- markers_cluster %>%
+  filter(p_val_adj < 0.05) %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 5) %>%
+  ungroup()
+
+cat("Genes para el heatmap (top 5 por cluster):", nrow(top5_cluster), "\n")
+
+# ── 1. EXTRACCIÓN SEGURA DE CÉLULAS ───────────────────────────────────────────
+set.seed(42)
+cells_sub <- seu@meta.data %>%
+  rownames_to_column("cell_id") %>%  # Salvamos los nombres de las células
+  group_by(seurat_clusters) %>%
+  slice_sample(n = 50) %>%           # Pedimos 50 directas (si hay menos, coge las que haya)
+  pull(cell_id)                      # Extraemos la lista limpia
+
+# ── 2. MINI-OBJETO Y ESCALADO RÁPIDO ──────────────────────────────────────────
+genes_heatmap <- unique(top5_cluster$gene)
+
+cat("Recortando y escalando datos para el heatmap...\n")
+# Creamos un objeto pequeñito solo con esas células
+seu_sub <- subset(seu, cells = cells_sub)
+# Escalamos solo los genes necesarios en este objeto pequeño
+seu_sub <- ScaleData(seu_sub, features = genes_heatmap, verbose = FALSE)
+
+# ── 3. DIBUJAR EL HEATMAP ─────────────────────────────────────────────────────
+p_heatmap_cluster <- DoHeatmap(
+  seu_sub,
+  features = genes_heatmap,
+  group.by = "seurat_clusters",
+  size     = 3,
+  angle    = 0,
+  hjust    = 0.5
+) +
+  scale_fill_gradientn(colors = c("#2166AC", "white", "#B2182B")) +
+  labs(title = "Heatmap — Top 5 marcadores por cluster (FC > 2, upregulated)") +
+  theme(plot.title  = element_text(size = 12, face = "bold"),
+        axis.text.y = element_text(size = 6))
+
+print(p_heatmap_cluster)
+
+ggsave(paste0(ruta_figuras, "Heatmap_Marcadores_por_Cluster.png"),
+       plot = p_heatmap_cluster, width = 16, height = 12, dpi = 300)
+```
+
+```{r tabla_top5_cluster}
+knitr::kable(
+  top5_cluster %>% select(cluster, gene, avg_log2FC, pct.1, pct.2, p_val_adj),
+  digits  = 3,
+  caption = "Top 5 marcadores por cluster (FC > 2, upregulated, p_adj < 0.05)"
+)
+```
+
+---
+
+# Heatmap — DEGs HI vs Control por tipo celular (label.main)
+
+Top 5 genes upregulated con FC > 2 en HI respecto a Control, calculados **por tipo celular**.
+
+```{r deg_por_tipo_celular}
+# DEGs HI vs Control dentro de cada tipo celular (label.main)
+# Se usa pseudobulk-like approach: FindMarkers por cada tipo
+tipos_celulares <- unique(seu$SingleR.Monaco.Main)
+tipos_celulares <- tipos_celulares[!is.na(tipos_celulares)]
+
+cat("Tipos celulares a analizar:", paste(tipos_celulares, collapse = ", "), "\n\n")
+
+Idents(seu) <- "SingleR.Monaco.Main"
+
+lista_deg_tipo <- list()
+
+for (tipo in tipos_celulares) {
+  
+  # Contar células de cada grupo en este tipo
+  n_ctrl <- sum(seu$SingleR.Monaco.Main == tipo & seu$grupo == "Control", na.rm = TRUE)
+  n_hi   <- sum(seu$SingleR.Monaco.Main == tipo & seu$grupo == "HI",      na.rm = TRUE)
+  
+  if (n_ctrl < 10 | n_hi < 10) {
+    cat(sprintf("  Saltando %-30s (Control: %d, HI: %d — insuficientes)\n",
+                tipo, n_ctrl, n_hi))
+    next
+  }
+  
+  cat(sprintf("  Analizando %-30s (Control: %d, HI: %d)\n", tipo, n_ctrl, n_hi))
+  
+  cells_tipo <- WhichCells(seu, idents = tipo)
+  seu_tipo   <- subset(seu, cells = cells_tipo)
+  Idents(seu_tipo) <- "grupo"
+  
+  deg_tipo <- tryCatch(
+    FindMarkers(seu_tipo,
+                ident.1         = "HI",
+                ident.2         = "Control",
+                min.pct         = 0.1,
+                logfc.threshold = log2(2),
+                test.use        = "wilcox",
+                verbose         = FALSE),
+    error = function(e) NULL
+  )
+  
+  if (!is.null(deg_tipo) && nrow(deg_tipo) > 0) {
+    deg_tipo$gene      <- rownames(deg_tipo)
+    deg_tipo$tipo      <- tipo
+    deg_tipo$direccion <- ifelse(deg_tipo$avg_log2FC > 0, "Up en HI", "Down en HI")
+    lista_deg_tipo[[tipo]] <- deg_tipo
+  }
+}
+
+# Restaurar identidades
+Idents(seu) <- "seurat_clusters"
+
+# Combinar todos los DEGs
+deg_por_tipo <- bind_rows(lista_deg_tipo)
+
+write.csv(deg_por_tipo,
+          paste0(ruta_tablas, "DEG_HI_vs_Control_por_tipo_celular.csv"),
+          row.names = FALSE)
+
+cat("\n── Resumen DEGs por tipo celular ───────────────────────────\n")
+resumen_deg <- deg_por_tipo %>%
+  filter(p_val_adj < 0.05) %>%
+  group_by(tipo, direccion) %>%
+  summarise(n_genes = n(), .groups = "drop") %>%
+  pivot_wider(names_from = direccion, values_from = n_genes, values_fill = 0)
+print(resumen_deg)
+```
+
+```{r heatmap_deg_tipo, fig.height=12, fig.width=14}
+
+# Top 5 upregulated en HI por tipo celular (FC > 2, p_adj < 0.05)
+top5_tipo <- deg_por_tipo %>%
+  filter(p_val_adj < 0.05, avg_log2FC > 0) %>%
+  group_by(tipo) %>%
+  slice_max(order_by = avg_log2FC, n = 5) %>%
+  ungroup()
+
+cat("Tipos con DEGs suficientes para el heatmap:", n_distinct(top5_tipo$tipo), "\n")
+cat("Genes totales en el heatmap:", n_distinct(top5_tipo$gene), "\n")
+
+if (nrow(top5_tipo) > 0) {
+  
+  genes_deg_tipo <- unique(top5_tipo$gene)
+  
+  # 1. Submuestra balanceada por tipo celular 
+  set.seed(42)
+  cells_tipo_sub <- seu@meta.data %>%
+    tibble::rownames_to_column("barcode") %>%
+    group_by(SingleR.Monaco.Main) %>%
+    slice_sample(n = 40) %>%             
+    pull(barcode)
+  
+  # 2. Recortar el objeto antes de escalar para que no se bloquee el ordenador
+  seu_sub2 <- subset(seu, cells = cells_tipo_sub)
+  seu_sub2 <- ScaleData(seu_sub2, features = genes_deg_tipo, verbose = FALSE) 
+  
+  # 3. Dibujar el Heatmap
+  p_heatmap_tipo <- DoHeatmap(
+    seu_sub2,
+    features = genes_deg_tipo,
+    group.by = "SingleR.Monaco.Main",      # Eliminamos el cells = cells_tipo_sub porque ya recortamos
+    size     = 3,
+    angle    = 30,
+    hjust    = 0.5
+  ) +
+    scale_fill_gradientn(colors = c("#2166AC", "white", "#B2182B")) +
+    labs(title    = "Heatmap — Top 5 DEGs upregulated en HI por tipo celular (FC > 2)",
+         subtitle = "HI vs Control · p_adj < 0.05") +
+    theme(plot.title  = element_text(size = 12, face = "bold"),
+          axis.text.y = element_text(size = 6))
+  
+  print(p_heatmap_tipo)
+  ggsave(paste0(ruta_figuras, "Heatmap_DEG_por_Tipo_Celular.png"),
+         plot = p_heatmap_tipo, width = 16, height = 12, dpi = 300)
+  
+} else {
+  message("No hay suficientes DEGs con FC > 2 y p_adj < 0.05 para el heatmap por tipo celular.")
+  message("Revisar los resultados en: ", paste0(ruta_tablas, "DEG_HI_vs_Control_por_tipo_celular.csv"))
+}
+```
+
+```{r tabla_top5_tipo}
+if (nrow(top5_tipo) > 0) {
+  knitr::kable(
+    top5_tipo %>% select(tipo, gene, avg_log2FC, pct.1, pct.2, p_val_adj),
+    digits  = 3,
+    caption = "Top 5 DEGs upregulated en HI por tipo celular (FC > 2, p_adj < 0.05)"
+  )
+}
+```
+
+# Heatmap — Tipo celular en cada cluster
+
+Representación del porcentaje de tipo celular en cada cluster.
+
+```{r heatmap_clusters_vs_tipos, fig.height=8, fig.width=10}
+# 1. Calcular el porcentaje exacto de cada tipo celular dentro de cada cluster
+mapa_composicion <- seu@meta.data %>%
+  filter(!is.na(SingleR.Monaco.Main)) %>%          # Quitamos células sin clasificar
+  group_by(seurat_clusters, SingleR.Monaco.Main) %>%
+  summarise(n = n(), .groups = "drop") %>%         # Contamos cuántas hay
+  group_by(seurat_clusters) %>%
+  mutate(pct = (n / sum(n)) * 100) %>%             # Calculamos el porcentaje sobre el total del cluster
+  ungroup() %>%
+  # Ordenar los clusters numéricamente para que el eje Y quede bonito
+  mutate(seurat_clusters = factor(seurat_clusters, 
+                                  levels = rev(sort(as.numeric(as.character(unique(seurat_clusters)))))))
+
+# 2. Dibujar el Heatmap con ggplot2 (geom_tile)
+p_heatmap_solapamiento <- ggplot(mapa_composicion, aes(x = SingleR.Monaco.Main, y = seurat_clusters, fill = pct)) +
+  # Dibujar los cuadrados (azulejos)
+  geom_tile(color = "grey90", linewidth = 0.5) +
+  
+  # Escribir el número del porcentaje dentro (solo si es > 5%)
+  geom_text(aes(label = ifelse(pct > 5, paste0(round(pct, 1), "%"), "")), 
+            size = 3, color = "black", fontface = "bold") +
+  
+  # Poner un color degradado (de blanco al rojo que has estado usando)
+  scale_fill_gradient(low = "white", high = "#e34459", name = "% en el cluster") +
+  
+  labs(title = "Correspondencia entre Clusters y Anotación Celular",
+       subtitle = "Porcentaje de cada tipo celular (Monaco Main) dentro de cada cluster",
+       x = "Tipo Celular",
+       y = "Cluster") +
+  
+  # Ponerlo limpio y profesional
+  theme_minimal() +
+  theme(
+    plot.title       = element_text(size = 14, face = "bold"),
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 10, color = "black", face = "bold"),
+    axis.text.y      = element_text(size = 10, color = "black", face = "bold"),
+    panel.grid       = element_blank() # Quitamos las líneas de fondo porque ya tenemos azulejos
+  )
+
+# Mostramos el resultado
+print(p_heatmap_solapamiento)
+
+# Guardamos la gráfica
+ggsave(paste0(ruta_figuras, "Heatmap_Solapamiento_Clusters_vs_Tipos.png"),
+       plot = p_heatmap_solapamiento, width = 12, height = 10, dpi = 300)
+```
+
+#MJ
+
+## Panel C — Composición de clusters por condición
+
+Barplot apilado 100%: cada barra es un cluster, los colores representan la proporción de células Control (azul) vs HI (rojo). Permite ver de un vistazo qué clusters están enriquecidos en una condición.
+
+```{r panel_c_MJ, fig.height=5, fig.width=13}
+# ── Calcular proporciones por cluster y condición ─────────────────────────────
+comp_cluster <- seu@meta.data %>%
+  group_by(seurat_clusters, grupo) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(seurat_clusters) %>%
+  mutate(
+    pct       = n / sum(n) * 100,
+    n_total   = sum(n),
+    cluster_label = paste0(seurat_clusters, "\n(n=", n_total, ")")
+  ) %>%
+  ungroup() %>%
+# Ordenar los clusters numéricamente (0, 1, 2, 3...)
+  mutate(seurat_clusters = factor(seurat_clusters, 
+                                  levels = sort(as.numeric(as.character(unique(seurat_clusters))))))
+
+panel_C_MJ <- ggplot(comp_cluster,
+                  aes(x = seurat_clusters, y = pct, fill = grupo)) +
+  geom_bar(stat = "identity", position = "stack",
+           width = 0.82, color = "white", linewidth = 0.25) +
+  # Línea de referencia en 50%
+  geom_hline(yintercept = 50, linetype = "dashed",
+             color = "grey30", linewidth = 0.4, alpha = 0.7) +
+  scale_fill_manual(values = col_grupo,
+                    labels = c("Control", "HI")) +
+  labs(
+    title    = "Panel C — Composición de clusters por condición",
+    x        = "Cluster",
+    y        = "% células",
+    fill     = "Condición"
+  ) +
+  theme_classic(base_size = base_size) +
+  theme(
+    # Título del panel en negrita, grande, alineado a la izquierda
+    plot.title       = element_text(size = 18, face = "bold", hjust = 0,
+                                    margin = margin(b = 2)),
+    plot.subtitle    = element_text(size = title_size, hjust = 0, color = "grey30",
+                                    margin = margin(b = 8)),
+    # Ejes
+    axis.text.x      = element_text(size = 8.5, color = "grey20"),
+    axis.text.y      = element_text(size = 9,   color = "grey20"),
+    axis.title       = element_text(size = 10,  color = "grey20"),
+    axis.line        = element_line(color = "grey50", linewidth = 0.4),
+    axis.ticks       = element_line(color = "grey50", linewidth = 0.3),
+    # Leyenda
+    legend.position  = "right",
+    legend.title     = element_text(size = 9,  face = "bold"),
+    legend.text      = element_text(size = 9),
+    legend.key.size  = unit(0.45, "cm"),
+    # Panel
+    panel.grid.major.y = element_line(color = "grey92", linewidth = 0.3),
+    plot.margin      = margin(10, 15, 10, 10)
+  )
+
+print(panel_C_MJ)
+
+ggsave(paste0(ruta_figuras, "panel_C_MJ_Composicion_Clusters.png"),
+       plot   = panel_C_MJ,
+       width  = 13,
+       height = 5,
+       dpi    = 300,
+       bg     = "white")
+
+cat("Panel C guardado.\n")
+```
+
+---
+
+## Panel D — Anotación de tipos celulares generales (UMAP)
+
+UMAP coloreado por tipo celular general (label.main de Monaco). Fondo limpio, etiquetas con caja blanca para legibilidad.
+
+```{r panel_d_MJ, fig.height=6.5, fig.width=8}
+panel_D_MJ  <- DimPlot(seu, reduction = "umap",
+                    group.by = "SingleR.Monaco.Main",
+                    label = TRUE, label.size = 3.5,
+                    repel = TRUE, raster = T) +
+  labs(
+      title    = "Panel D — Tipos celulares generales",
+      subtitle = "Anotación Single R — Monaco (label.main)"
+    ) +
+    theme_void(base_size = base_size) +
+    theme(
+      plot.title    = element_text(size = 18, face = "bold", hjust = 0,
+                                   margin = margin(b = 2)),
+      plot.subtitle = element_text(size = title_size, hjust = 0, color = "grey30",
+                                   margin = margin(b = 6)),
+      legend.position = "none",    
+      plot.margin   = margin(10, 10, 10, 10),
+      plot.background = element_rect(fill = "white", color = NA)
+    )
+  guides(color = guide_legend(ncol = 4, override.aes = list(size = 3)))
+
+print(panel_D_MJ )
+
+
+ggsave(paste0(ruta_figuras, "panel_D_MJ_UMAP_Tipos_Celulares.png"),
+       plot   = panel_D_MJ,
+       width  = 8,
+       height = 6.5,
+       dpi    = 300,
+       bg     = "white")
+
+cat("Panel D guardado.\n")
+```
+
+---
+
+## Panel E — Distribución de tipos celulares por condición
+
+Barplot de barras agrupadas (dodge): eje X = tipos celulares, eje Y = % medio de células (media por muestra ± SD), colores = condición. Permite comparar directamente Control vs HI en cada tipo.
+
+```{r}
+# 1. Calculamos la proporción usando la anotación DETALLADA (Fine)
+composicion_grupos <- seu@meta.data %>%
+    group_by(grupo, SingleR.Monaco.Fine) %>%           
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(grupo) %>%
+    mutate(pct = round(n/sum(n) * 100, 2)) %>%
+    arrange(grupo, desc(pct)) %>%
+    filter(!is.na(SingleR.Monaco.Fine))                
+
+# 2. Sacamos el Top 15 de los subtipos celulares
+top_tipos <- composicion_grupos %>%
+    group_by(SingleR.Monaco.Fine) %>%
+    summarise(n_total = sum(n)) %>%
+    slice_max(n_total, n = 15) %>%
+    pull(SingleR.Monaco.Fine)
+
+# 3. Dibujamos el Barplot para la tutora
+panel_E_MJ <- composicion_grupos %>%
+    filter(SingleR.Monaco.Fine %in% top_tipos) %>%
+    ggplot(aes(x = reorder(SingleR.Monaco.Fine, -pct), y = pct, fill = grupo)) + 
+    geom_bar(stat = "identity", position = "dodge", color = "white", linewidth = 0.2) + 
+    scale_fill_manual(values = c("Control" = "#4e79a7", "HI" = "#e34459")) + 
+    labs(title = "Panel E — Composición celular",
+         subtitle = "Control vs HI (Top 15 tipos celulares)",
+         x = NULL, y = "% células", fill = "Condición") + 
+    theme_classic() + 
+    theme(
+        plot.title = element_text(size = 14, face = "bold"),
+        # Ángulo 45 para que se lean bien los nombres largos de label.fine
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "black"), 
+        axis.text.y = element_text(size = 10, color = "black")
+    )
+
+print(panel_E_MJ)
+
+# Guardamos la gráfica
+ggsave(paste0(ruta_figuras, "Panel_E_Composicion_Control_vs_HI_Detallada.png"),
+       plot = panel_E_MJ, width = 12, height = 6, dpi = 300)
+```
+
+# Grafico de barras
+
+---
+
+# Exportación de figuras combinadas
+
+```{r export_pdf_final}
+ruta_pdf <- paste0(ruta_figuras, "Figuras_completas_visualizacion.pdf")
+
+pdf(ruta_pdf, width = 16, height = 10)
+
+# Panel A
+print(panel_A)
+
+# Panel B
+print(panel_B)
+
+# Panel C
+print(p_c_main)
+print(p_c_fine)
+print(panel_C)
+
+# Panel D — UMAP y volcano
+
+print(p_d_split)
+print(p_d_grupo)
+print(p_volcano)
+
+# Barplots composición
+print(panel_comp_muestra)
+print(p_comp_muestra_main)
+print(p_comp_muestra_fine)
+print(panel_comp_grupo)
+print(p_grupo_main)
+print(p_grupo_fine)
+print(panel_E_MJ)
+
+print(panel_C_MJ)
+print(panel_D_MJ)
+
+print(p_heatmap_cluster)
+print(p_heatmap_tipo)
+print(p_heatmap_solapamiento)
+
+
+dev.off()
+cat("PDF completo guardado en:", ruta_pdf, "\n")
+```
+
+---
+
+# Resumen de figuras generadas
+
+```{r resumen_figuras}
+cat("══ FIGURAS EXPORTADAS ══════════════════════════════════════\n")
+figuras <- list.files(ruta_figuras, pattern = "\\.png$|\\.pdf$", full.names = FALSE)
+for (f in figuras) cat(" ·", f, "\n")
+
+cat("\n══ TABLAS EXPORTADAS ═══════════════════════════════════════\n")
+tablas <- list.files(ruta_tablas, pattern = "\\.csv$", full.names = FALSE)
+for (t in tablas) cat(" ·", t, "\n")
+cat("════════════════════════════════════════════════════════════\n")
+```

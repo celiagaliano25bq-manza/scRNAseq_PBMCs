@@ -1,0 +1,849 @@
+---
+title: "Integración de muestras scRNA-seq con Harmony"
+subtitle: "Muestras: C1_B3, C2_B8, HI1_B1, HI3_B2, HI4_B4, HI8_B5, HI9_B6"
+author: "Celia Galiano Manzanares"
+date: '`r format(Sys.Date(), "%d de %B de %Y")`'
+output:
+  html_document:
+    theme: united
+    df_print: kable
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy      = TRUE,
+  tidy.opts = list(width.cutoff = 95),
+  message   = FALSE,
+  warning   = FALSE,
+  error     = TRUE
+)
+```
+
+> **Nota de uso:** Este script integra los objetos Seurat preprocesados de forma independiente mediante `merge` + Harmony. El merge previo al análisis de memoria permite estimar si el ordenador puede soportar la integración completa antes de ejecutar Harmony.
+
+---
+
+## Setup y parámetros
+
+```{r libraries}
+library(Seurat)
+library(harmony)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(SingleR)
+library(celldex)
+```
+
+```{r init}
+# ── RUTAS ──────────────────────────────────────────────────────────────────────
+ruta_workspace <- "./" 
+ruta_rds_in    <- paste0(ruta_workspace, "output/rds/")
+ruta_out       <- paste0(ruta_workspace, "output/integracion/")
+ruta_imagenes  <- paste0(ruta_out, "images/")
+ruta_paneles   <- paste0(ruta_out, "paneles/")
+
+# Crear carpetas de salida si no existen
+for (d in c(ruta_out, ruta_imagenes, ruta_paneles)) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+}
+
+# Nombres de las muestras y sus grupos (Control vs HI)
+muestras <- c("C1_B3", "C2_B8", "HI1_B1", "HI3_B2", "HI4_B4", "HI8_B5", "HI9_B6")
+
+grupo_map <- c(
+  C1_B3   = "Control",
+  C2_B8   = "Control",
+  HI1_B1  = "HI",
+  HI3_B2  = "HI",
+  HI4_B4  = "HI",
+  HI8_B5  = "HI",
+  HI9_B6  = "HI"
+)
+
+cat("Muestras a integrar:", paste(muestras, collapse = ", "), "\n")
+cat("Rutas configuradas:\n")
+cat("  RDS entrada: ", ruta_rds_in,  "\n")
+cat("  Salida:      ", ruta_out,     "\n")
+```
+
+---
+
+## Carga de objetos Seurat
+
+```{r load_objects}
+# Cargar los 8 objetos _final.rds generados en el preprocesamiento
+lista_seu <- list()
+
+for (muestra in muestras) {
+  ruta_rds <- paste0(ruta_rds_in, muestra, "_final.rds")
+  
+  if (!file.exists(ruta_rds)) {
+    warning("Archivo no encontrado: ", ruta_rds)
+    next
+  }
+  
+  cat("Cargando:", muestra, "... ")
+  seu_tmp <- readRDS(ruta_rds)
+  
+  # Asegurar que el orig.ident sea el nombre de la muestra
+  seu_tmp@meta.data$orig.ident <- muestra
+  
+  # Añadir metadato de grupo (Control vs HI)
+  seu_tmp@meta.data$grupo      <- unname(grupo_map[muestra])
+  
+  lista_seu[[muestra]] <- seu_tmp
+  cat(ncol(seu_tmp), "células\n")
+  
+  gc()
+}
+
+cat("\n── Resumen de carga ────────────────────────────────────────\n")
+cat("Muestras cargadas:", length(lista_seu), "/", length(muestras), "\n")
+```
+
+---
+
+## Diagnóstico de memoria pre-merge
+
+Antes de hacer el merge, se estima el uso de RAM para decidir si continuar o si es necesario reducir el número de muestras.
+
+```{r memory_check}
+# Tamaño de cada objeto en MB
+cat("── Tamaño individual de cada objeto ────────────────────────\n")
+tam_total_mb <- 0
+n_celulas_total <- 0
+
+for (muestra in names(lista_seu)) {
+  tam_mb <- round(object.size(lista_seu[[muestra]]) / 1024^2, 1)
+  n_cel  <- ncol(lista_seu[[muestra]])
+  cat(sprintf("  %-12s : %6d células | %6.0f MB\n", muestra, n_cel, tam_mb))
+  tam_total_mb    <- tam_total_mb    + tam_mb
+  n_celulas_total <- n_celulas_total + n_cel
+}
+
+cat(sprintf("\nTotal estimado suma de objetos: %.0f MB (%.1f GB)\n",
+            tam_total_mb, tam_total_mb / 1024))
+cat(sprintf("Total de células:               %d\n", n_celulas_total))
+
+```
+
+---
+
+## Merge de todos los objetos
+
+Se fusionan los 8 objetos Seurat en uno solo sin corregir el efecto batch (eso lo hará Harmony después). El merge es la forma más eficiente en memoria porque evita duplicar matrices de assay.
+
+```{r merge_objects}
+t0 <- Sys.time()
+
+# merge() con add.cell.ids asigna prefijos a los barcodes para evitar colisiones
+seu_merged <- merge(
+  x            = lista_seu[[1]],
+  y            = lapply(lista_seu[-1], function(x) x),
+  add.cell.ids = names(lista_seu),
+  merge.data   = FALSE   # No heredar la normalización: se renormalizará
+)
+
+t1 <- Sys.time()
+cat("Células totales en el objeto merged:", ncol(seu_merged), "\n")
+cat("Genes en el objeto merged:          ", nrow(seu_merged), "\n")
+
+# Liberar memoria — los objetos individuales ya no son necesarios
+rm(lista_seu)
+gc()
+
+cat("\nMemoria tras liberar lista de objetos:\n")
+cat(sprintf("  Objeto merged: %.0f MB\n", object.size(seu_merged) / 1024^2))
+```
+
+```{r merge_summary, fig.height=5, fig.width=10}
+# Distribución de células por muestra y por grupo
+tabla_celulas <- seu_merged@meta.data %>%
+  group_by(orig.ident, grupo) %>%
+  summarise(n_celulas = n(),
+            genes_mediana = round(median(nFeature_RNA)),
+            UMIs_mediana  = round(median(nCount_RNA)),
+            MT_mediana    = round(median(percent.MT), 2),
+            .groups = "drop") %>%
+  arrange(grupo, orig.ident)
+
+cat("── Células por muestra ─────────────────────────────────────\n")
+print(tabla_celulas)
+
+# Barplot de células por muestra
+ggplot(tabla_celulas, aes(x = orig.ident, y = n_celulas, fill = grupo)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("Control" = "#4e79a7", "HI" = "#e34459")) +
+  labs(title = "Células por muestra tras merge",
+       x = NULL, y = "Número de células", fill = "Grupo") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+---
+
+## Preprocesamiento del objeto merged (pre-Harmony)
+
+Harmony requiere un espacio PCA conjunto. Se renormaliza y recalcula el PCA sobre el objeto merged antes de aplicar la corrección de batch.
+
+```{r preprocess_merged}
+cat("Normalizanción...\n")
+seu_merged <- NormalizeData(seu_merged, normalization.method = "LogNormalize",
+                            scale.factor = 1e4, verbose = FALSE)
+cat("Identificación de genes variables...\n")
+
+seu_merged <- FindVariableFeatures(seu_merged, selection.method = "vst",
+                                   nfeatures = 2000, verbose = FALSE)
+
+cat("Escalar...\n")
+seu_merged <- ScaleData(seu_merged, verbose = FALSE)
+
+cat("Calcular PCA...\n")
+seu_merged <- RunPCA(seu_merged, npcs = 30, verbose = FALSE)
+
+gc()
+```
+
+```{r elbow_merged, fig.height=5, fig.width=8}
+ElbowPlot(seu_merged, ndims = 30) +
+  ggtitle("ElbowPlot — Objeto merged (pre-Harmony)") +
+  geom_vline(xintercept = 20, linetype = "dashed", color = "#e34459", alpha = 0.6) +
+  annotate("text", x = 21, y = max(seu_merged@reductions$pca@stdev) * 0.9,
+           label = "dims_use = 20", color = "#e34459", hjust = 0, size = 3.5)
+```
+
+```{r umap_preharmony, fig.height=8, fig.width=16}
+# UMAP pre-Harmony para visualizar el efecto de batch ANTES de corregirlo
+seu_merged <- RunUMAP(seu_merged, dims = 1:20, reduction.name = "umap.preharmony",
+                      verbose = FALSE)
+
+p_pre_muestra <- DimPlot(seu_merged, reduction = "umap.preharmony",
+                          group.by = "orig.ident", label = FALSE, raster = T) +
+  ggtitle("UMAP PRE-Harmony — por muestra") +
+  theme(legend.position = "right")
+
+p_pre_grupo <- DimPlot(seu_merged, reduction = "umap.preharmony", raster = T,
+                        group.by = "grupo",
+                        cols = c("Control" = "#4e79a7", "HI" = "#e34459")) +
+  ggtitle("UMAP PRE-Harmony — por grupo") +
+  theme(legend.position = "right")
+
+p_pre_muestra | p_pre_grupo
+```
+
+Si las células de distintas muestras o grupos aparecen claramente separadas en el UMAP pre-Harmony, es señal de efecto batch. Harmony debería corregirlo y mezclar las células de distintas muestras dentro de cada tipo celular real.
+
+---
+
+## Integración con Harmony
+
+```{r harmony, fig.height=5, fig.width=8}
+# ── PARÁMETROS DE HARMONY ───────────────────────────────────────────────────────
+dims_use     <- 1:20   # Ajustar según ElbowPlot
+theta_val    <- 2      # Fuerza de corrección: 1–2 estándar; >2 si el batch es muy fuerte
+lambda_val   <- 1      # Regularización: 1 estándar
+max_iter_val <- 10     # Iteraciones máximas
+# ────────────────────────────────────────────────────────────────────────────────
+t0 <- Sys.time()
+cat("Harmony corrigiendo por muestra...\n")
+seu_merged <- RunHarmony(
+  seu_merged,
+  group.by.vars  = "orig.ident",   # Corregir por muestra
+  dims.use       = dims_use,
+  theta          = theta_val,
+  lambda         = lambda_val,
+  max_iter = max_iter_val,
+  plot_convergence = TRUE,         
+  verbose        = TRUE
+)
+cat("Harmony corrigiendo por muestra y condición...\n")
+seu_merged <- RunHarmony(
+  seu_merged,
+  group.by.vars  = c("orig.ident", "grupo"), # corregir por GRUPO + MUESTRAS
+  dims.use       = dims_use,
+  theta          = c(theta_val, theta_val),
+  lambda         = lambda_val,
+  max_iter = max_iter_val,
+  plot_convergence = FALSE, 
+  verbose        = FALSE,
+  reduction.save = "harmony_doble" # nombre diferente al solo por muestra
+)
+
+t1 <- Sys.time()
+cat(sprintf("\nHarmony completado en %.1f segundos\n",
+            as.numeric(difftime(t1, t0, units="secs"))))
+gc()
+```
+
+La curva de convergencia debe mostrar un descenso rápido en las primeras iteraciones y estabilizarse. Si no converge dentro de `max_iter`, aumentar el valor. Si la curva baja pero oscila, considerar aumentar `lambda`.
+
+---
+
+## Clustering y UMAP post-Harmony. Reducción por muestra
+
+```{r post_harmony_clustering}
+# ── PARÁMETROS POST-HARMONY ─────────────────────────────────────────────────────
+dims_harmony     <- 1:20   # Usar los mismos dims que en Harmony
+resolucion_final <- 0.8    # Resolución de clustering (ajustar si es necesario)
+# ────────────────────────────────────────────────────────────────────────────────
+
+cat("Calculando UMAP post-Harmony...\n")
+seu_merged <- RunUMAP(seu_merged,
+                      reduction      = "harmony",
+                      dims           = dims_harmony,
+                      reduction.name = "umap",
+                      verbose        = FALSE)
+
+cat("Calculando vecinos...\n")
+seu_merged <- FindNeighbors(seu_merged,
+                             reduction = "harmony",
+                             dims      = dims_harmony,
+                             verbose   = FALSE)
+
+cat("Clustering (resolución", resolucion_final, ")...\n")
+seu_merged <- FindClusters(seu_merged,
+                            resolution = resolucion_final,
+                            verbose    = FALSE)
+
+cat("Número de clusters:", length(unique(seu_merged$seurat_clusters)), "\n")
+gc()
+```
+
+```{r umap_postharmony, fig.height=16, fig.width=16}
+p1 <- DimPlot(seu_merged, reduction = "umap", group.by = "seurat_clusters", raster = T,
+              label = TRUE, label.size = 3) +
+  ggtitle("UMAP POST-Harmony — clusters") +
+  theme(legend.position = "none")
+
+p2 <- DimPlot(seu_merged, reduction = "umap", group.by = "orig.ident", raster = T) +
+  ggtitle("UMAP POST-Harmony — por muestra") +
+  theme(legend.position = "right")
+
+p3 <- DimPlot(seu_merged, reduction = "umap", group.by = "grupo", raster = T,
+              cols = c("Control" = "#4e79a7", "HI" = "#e34459")) +
+  ggtitle("UMAP POST-Harmony — por grupo") +
+  theme(legend.position = "right")
+
+p4 <- FeaturePlot(seu_merged, features = "nFeature_RNA",raster = T) +
+  ggtitle("nFeature_RNA")
+
+(p1 | p2) / (p3 | p4)
+```
+
+**Criterios de calidad del UMAP post-Harmony:**
+
+- Las células de las distintas muestras deben estar mezcladas dentro de cada cluster (sin segregación por muestra).
+- Los grupos Control y HI deben solaparse en los tipos celulares compartidos.
+- Los clusters deben ser compactos y bien separados.
+
+### Control de integración — reducción por muestra
+
+```{r mixing_check, fig.height=5, fig.width=10}
+# Composición de cada cluster por muestra
+composicion <- seu_merged@meta.data %>%
+  group_by(seurat_clusters, orig.ident, grupo) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(seurat_clusters) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  arrange(seurat_clusters, orig.ident)
+
+# Heatmap de composición por muestra
+composicion_wide <- composicion %>%
+  select(seurat_clusters, orig.ident, pct) %>%
+  tidyr::pivot_wider(names_from = orig.ident, values_from = pct, values_fill = 0)
+
+cat("Composición (%) por muestra en cada cluster:\n")
+print(composicion_wide)
+
+# Barplot apilado: proporción de cada muestra en cada cluster
+ggplot(composicion, aes(x = seurat_clusters, y = pct, fill = orig.ident)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Composición por muestra en cada cluster post-Harmony",
+       x = "Cluster", y = "Proporción", fill = "Muestra") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Una buena integración muestra que todos los clusters contienen células de múltiples muestras. Un cluster dominado por una única muestra (>80%) puede indicar un tipo celular específico de esa muestra o un artefacto de integración.
+
+```{r check, fig.height=5, fig.width=10}
+# Barplot apilado: proporción de Control vs HI en cada cluster
+ggplot(composicion, aes(x = seurat_clusters, y = pct, fill = grupo)) +  
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("Control" = "#4e79a7", "HI" = "#e34459")) + 
+  labs(title = "Composición por grupo (Control vs HI) en cada cluster",
+       x = "Cluster", y = "Proporción", fill = "Condición") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Clustering y UMAP post-Harmony. Reducción por muestra y condición
+
+```{r calc_umap_doble}
+cat("Calculando UMAP para Harmony Doble (solo para visualización)...\n")
+seu_merged <- RunUMAP(seu_merged,
+                      reduction      = "harmony_doble", # Usamos la sobre-integración
+                      dims           = dims_harmony,
+                      reduction.name = "umap_doble",    # Lo guardamos con nombre nuevo
+                      verbose        = FALSE)
+gc()
+```
+
+```{r post_harmony_clustering_doble}
+# ── PARÁMETROS POST-HARMONY DOBLE ───────────────────────────────────────────────
+dims_harmony     <- 1:20   
+resolucion_final <- 0.8    
+# ────────────────────────────────────────────────────────────────────────────────
+
+cat("Calculando vecinos (Harmony Doble)...\n")
+seu_merged <- FindNeighbors(seu_merged,
+                             reduction = "harmony_doble",     # Usamos el doble
+                             dims      = dims_harmony,
+                             graph.name = c("doble_nn", "doble_snn"), # Nombres nuevos
+                             verbose   = FALSE)
+
+cat("Clustering (resolución", resolucion_final, ")...\n")
+seu_merged <- FindClusters(seu_merged,
+                            resolution = resolucion_final,
+                            graph.name = "doble_snn",         # Usamos la red nueva
+                            cluster.name = "clusters_doble",  # COLUMNA NUEVA
+                            verbose    = FALSE)
+
+cat("Número de clusters (Doble):", length(unique(seu_merged$clusters_doble)), "\n")
+gc()
+```
+
+```{r mixing_check_doble2, fig.height=16, fig.width=16}
+# Composición de cada cluster DOBLE por muestra
+composicion_doble <- seu_merged@meta.data %>%
+  group_by(clusters_doble, orig.ident, grupo) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(clusters_doble) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  arrange(clusters_doble, orig.ident)
+
+p5 <- DimPlot(seu_merged, reduction = "umap_doble", group.by = "clusters_doble", raster = TRUE,
+              label = TRUE, label.size = 3) +
+  ggtitle("UMAP Harmony DOBLE — clusters") +
+  theme(legend.position = "none")
+
+p6 <- DimPlot(seu_merged, reduction = "umap_doble", group.by = "orig.ident", raster = TRUE) +
+  ggtitle("UMAP Harmony DOBLE — por muestra") +
+  theme(legend.position = "right")
+
+p7 <- DimPlot(seu_merged, reduction = "umap_doble", group.by = "grupo", raster = TRUE,
+              cols = c("Control" = "#4e79a7", "HI" = "#e34459")) +
+  ggtitle("UMAP Harmony DOBLE — por grupo") +
+  theme(legend.position = "right")
+
+p8 <- FeaturePlot(seu_merged, features = "nFeature_RNA", reduction = "umap_doble", raster = TRUE) +
+  ggtitle("nFeature_RNA (Harmony Doble)")
+
+(p5 | p6) / (p7 | p8)
+```
+
+```{r mixing_check_doble, fig.height=5, fig.width=10}
+# Heatmap de composición por muestra (Doble)
+composicion_wide_doble <- composicion_doble %>%
+  select(clusters_doble, orig.ident, pct) %>%
+  tidyr::pivot_wider(names_from = orig.ident, values_from = pct, values_fill = 0)
+
+cat("Composición (%) por muestra en cada cluster (Harmony Doble):\n")
+print(composicion_wide_doble)
+
+# Barplot apilado: proporción de cada muestra en cada cluster DOBLE
+ggplot(composicion_doble, aes(x = clusters_doble, y = pct, fill = orig.ident)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Composición por muestra en cada cluster (Harmony DOBLE)",
+       x = "Cluster Doble", y = "Proporción", fill = "Muestra") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Barplot apilado: proporción de Control vs HI en cada cluster DOBLE
+ggplot(composicion_doble, aes(x = clusters_doble, y = pct, fill = grupo)) +  
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("Control" = "#4e79a7", "HI" = "#e34459")) + 
+  labs(title = "Composición por grupo (Control vs HI) en cada cluster (Harmony DOBLE)",
+       x = "Cluster", y = "Proporción", fill = "Condición") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+---
+
+```{r clustree_evolucion, fig.height=10, fig.width=20}
+library(clustree)
+
+# ── 1. CLUSTREE: HARMONY NORMAL (Solo por muestra) ────────────────────────────
+cat("Calculando resoluciones para Harmony Normal...\n")
+# Creamos la red con las coordenadas buenas y le llamamos "harmony_snn"
+seu_merged <- FindNeighbors(seu_merged, 
+                            reduction = "harmony", 
+                            dims = dims_harmony, 
+                            graph.name = "harmony_snn", 
+                            verbose = FALSE)
+
+# Calculamos los clusters a varias resoluciones sobre esa red
+seu_merged <- FindClusters(seu_merged, 
+                           resolution = c(0.2, 0.4, 0.6, 0.8, 1.0, 1.2), 
+                           graph.name = "harmony_snn", 
+                           verbose = FALSE)
+
+# Le decimos a clustree que busque las columnas que empiezan por "harmony_snn_res."
+p_tree_normal <- clustree(seu_merged, prefix = "harmony_snn_res.") +
+                 ggtitle("Clustree - Harmony Normal (Por Muestra)") +
+                 theme(plot.title = element_text(size = 14, face = "bold"))
+
+
+print(p_tree_normal)
+
+```
+```{r clustree_evolucion_doble, fig.height=10, fig.width=20}
+# ── 2. CLUSTREE: HARMONY DOBLE (Muestra + Condición) ──────────────────────────
+cat("Calculando resoluciones para Harmony Doble...\n")
+# Creamos la red con las coordenadas sobre-integradas y le llamamos "doble_snn"
+seu_merged <- FindNeighbors(seu_merged, 
+                            reduction = "harmony_doble", 
+                            dims = dims_harmony, 
+                            graph.name = "doble_snn", 
+                            verbose = FALSE)
+
+# Calculamos los clusters a varias resoluciones sobre esta segunda red
+seu_merged <- FindClusters(seu_merged, 
+                           resolution = c(0.2, 0.4, 0.6, 0.8, 1.0, 1.2), 
+                           graph.name = "doble_snn", 
+                           verbose = FALSE)
+
+# Le decimos a clustree que busque las columnas que empiezan por "doble_snn_res."
+p_tree_doble <- clustree(seu_merged, prefix = "doble_snn_res.") +
+                ggtitle("Clustree - Harmony DOBLE (Sobre-integrado)") +
+                theme(plot.title = element_text(size = 14, face = "bold"))
+p_tree_doble
+```
+
+
+```{r elegir_reduccion}
+# el identificador oficial vuelve a ser el original
+Idents(seu_merged) <- "seurat_clusters"
+```
+
+
+---
+
+## Marcadores diferenciales post-integración
+
+```{r markers_integrated}
+seu_merged <- JoinLayers(seu_merged)
+
+n_clusters <- length(unique(seu_merged$seurat_clusters))
+cat("Calculando marcadores para", n_clusters, "clusters...\n")
+
+if (n_clusters > 1) {
+  markers_integrated <- FindAllMarkers(
+    seu_merged,
+    only.pos       = TRUE,
+    min.pct        = 0.25,
+    logfc.threshold= 0.25,
+    max.cells.per.ident = 200,
+    verbose        = FALSE
+  )
+  
+  markers_integrated %>%
+    group_by(cluster) %>%
+    filter(avg_log2FC > 1) %>%
+    slice_max(n = 5, order_by = avg_log2FC) %>%
+    knitr::kable(caption = "Top 3 marcadores por cluster (post-Harmony)")
+  
+} else {
+  message("Solo hay 1 cluster — FindAllMarkers no es aplicable.")
+}
+```
+
+```{r feature_plots_integrated, fig.height=10, fig.width=12}
+FeaturePlot(seu_merged, features = c("S100A8", "CST3", "IL7R", "CD8A",
+                                      "GZMA", "MS4A1", "TNFRSF17", "CD34"),
+            ncol = 4, reduction = "umap") +
+  plot_annotation(title = "Marcadores canónicos — objeto integrado")
+```
+
+---
+
+## Anotación automática con SingleR (objeto integrado)
+
+```{r singler_integrated, fig.height=20, fig.width=14}
+cat("Cargando la base de datos Monaco...\n")
+ref.monaco <- MonacoImmuneData()
+
+# Extraemos la matriz de expresión de tu objeto integrado
+datos_merged <- GetAssayData(seu_merged, assay = "RNA", layer = "data")
+
+cat("Anotando células a nivel detallado (label.fine)...\n")
+predictions_fine <- SingleR(
+  test   = datos_merged,
+  ref    = ref.monaco,
+  labels = ref.monaco$label.fine
+)
+
+cat("Anotando células a nivel general (label.main)...\n")
+predictions_main <- SingleR(
+  test   = datos_merged,
+  ref    = ref.monaco,
+  labels = ref.monaco$label.main
+)
+
+# Guardamos las dos etiquetas como columnas nuevas en los metadatos
+seu_merged[["SingleR.Monaco.Fine"]] <- predictions_fine$labels
+seu_merged[["SingleR.Monaco.Main"]] <- predictions_main$labels
+
+# ── GRÁFICAS DE ANOTACIÓN ─────────────────────────────────────────────────────
+
+# Gráfico 1: Anotación General
+p_main <- DimPlot(seu_merged, reduction = "umap", group.by = "SingleR.Monaco.Main",
+                  label = TRUE, label.size = 4, repel = TRUE, raster = TRUE) +
+  ggtitle("Anotación SingleR (Nivel General)") +
+  theme(legend.position = "none")
+
+# Gráfico 2: Anotación Detallada 
+p_fine <- DimPlot(seu_merged, reduction = "umap", group.by = "SingleR.Monaco.Fine",
+                  label = TRUE, label.size = 2.5, repel = TRUE, raster = TRUE,) +
+  ggtitle("Anotación SingleR (Nivel Detallado - label.fine)") +
+  theme(legend.position = "bottom",
+        legend.text  = element_text(size = 8)) +
+  guides(color = guide_legend(ncol = 4, override.aes = list(size = 3)))
+
+# Mostramos los dos juntos
+p_main / p_fine
+
+# Guardamos la gráfica doble en tu carpeta
+ggsave(paste0(ruta_paneles, "Anotacion_SingleR_Doble.png"), plot = (p_main / p_fine), width = 12, height = 16)
+```
+
+```{r singler_cluster_summary}
+# Anotación mayoritaria por cluster
+resumen_anotacion <- seu_merged@meta.data %>%
+  group_by(seurat_clusters, SingleR.Monaco) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(seurat_clusters) %>%
+  slice_max(n, n = 1) %>%
+  arrange(seurat_clusters)
+
+cat("Anotación mayoritaria por cluster (Monaco):\n")
+print(resumen_anotacion)
+```
+
+---
+
+## Análisis de composición celular Control vs HI
+
+```{r composition_analysis, fig.height=6, fig.width=12}
+# Proporción de cada tipo celular (por anotación Monaco) en cada grupo
+composicion_grupos <- seu_merged@meta.data %>%
+  group_by(grupo, SingleR.Monaco) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(grupo) %>%
+  mutate(pct = round(n / sum(n) * 100, 2)) %>%
+  arrange(grupo, desc(pct))
+
+# Barplot: composición celular por grupo
+top_tipos <- composicion_grupos %>%
+  group_by(SingleR.Monaco) %>%
+  summarise(n_total = sum(n)) %>%
+  slice_max(n_total, n = 15) %>%
+  pull(SingleR.Monaco)
+
+composicion_grupos %>%
+  filter(SingleR.Monaco %in% top_tipos) %>%
+  ggplot(aes(x = reorder(SingleR.Monaco, -pct), y = pct, fill = grupo)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Control" = "#4e79a7", "HI" = "#e15759")) +
+  labs(title = "Composición celular: Control vs HI (Top 15 tipos)",
+       x = NULL, y = "% células", fill = "Grupo") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9))
+```
+
+```{r composition_table}
+# Tabla comparativa de proporciones
+composicion_wide2 <- composicion_grupos %>%
+  select(grupo, SingleR.Monaco, pct) %>%
+  tidyr::pivot_wider(names_from = grupo, values_from = pct, values_fill = 0) %>%
+  mutate(diff_HI_vs_Control = round(HI - Control, 2)) %>%
+  arrange(desc(abs(diff_HI_vs_Control)))
+
+cat("Diferencias de composición HI vs Control (ordenado por magnitud de diferencia):\n")
+print(composicion_wide2)
+
+write.csv(composicion_wide2,
+          file = paste0(ruta_out, "composicion_celular_HI_vs_Control.csv"),
+          row.names = FALSE)
+```
+
+---
+
+## Paneles
+
+En esta sección se generan y exportan automáticamente los paneles solicitados para la Figura 1 del informe.
+
+```{r figura_1_paneles, fig.height=8, fig.width=12}
+# ── PANEL A: Control de Calidad ───────────────────────────────────────────────
+panel_a <- VlnPlot(seu_merged, 
+                   features = c("nFeature_RNA", "nCount_RNA", "percent.MT"), 
+                   group.by = "orig.ident", 
+                   pt.size = 0, 
+                   ncol = 3) + 
+           plot_annotation(title = "Panel A: Control de Calidad por Muestra")
+
+print(panel_a)
+ggsave(paste0(ruta_paneles, "Panel_A_QC.png"), plot = panel_a, width = 12, height = 5)
+
+# ── PANEL B: UMAP Global por Clusters ─────────────────────────────────────────
+panel_b <- DimPlot(seu_merged, 
+                   reduction = "umap", 
+                   group.by = "seurat_clusters", 
+                   label = TRUE, 
+                   label.size = 4,
+                   raster = TRUE) +
+           ggtitle("Panel B: UMAP Global (Clusters)") +
+           theme(legend.position = "none")
+
+print(panel_b)
+ggsave(paste0(ruta_paneles, "Panel_B_Clusters.png"), plot = panel_b, width = 7, height = 6)
+
+# ── PANEL C: Anotación Celular ────────────────────────────────────────────────
+panel_c <- DimPlot(seu_merged, 
+                   reduction = "umap", 
+                   group.by = "SingleR.Monaco", 
+                   label = TRUE, 
+                   label.size = 3, 
+                   repel = TRUE,
+                   raster = TRUE) +
+           ggtitle("Panel C: Anotación Celular") +
+           theme(legend.position = "right")
+
+print(panel_c)
+ggsave(paste0(ruta_imagenes, "Panel_C_Anotacion.png"), plot = panel_c, width = 9, height = 6)
+
+# ── PANEL D: UMAP Condición y Expresión Diferencial ───────────────────────────
+panel_d_umap <- DimPlot(seu_merged, 
+                        reduction = "umap", 
+                        group.by = "grupo",
+                        raster = TRUE,
+                        cols = c("Control" = "#4e79a7", "HI" = "#e15759")) +
+                ggtitle("Panel D: UMAP (HI vs Control)")
+
+print(panel_d_umap)
+ggsave(paste0(ruta_paneles, "Panel_D_UMAP_Condicion.png"), plot = panel_d_umap, width = 7, height = 6)
+
+# Expresión diferencial global
+cat("Calculando expresión diferencial global (HI vs Control)...\n")
+Idents(seu_merged) <- "grupo"
+dge_global <- FindMarkers(seu_merged, 
+                          ident.1 = "HI", 
+                          ident.2 = "Control", 
+                          min.pct = 0.1, 
+                          logfc.threshold = 0.25)
+
+# Guardar tabla de genes en Excel (.csv)
+write.csv(dge_global, file = paste0(ruta_out, "Panel_D_DGE_Global.csv"))
+write.csv(dge_global, file = paste0(ruta_paneles, "Panel_D_DGE_Global.csv"))
+
+cat("── Top 10 genes sobreexpresados globalmente en HI ──\n")
+top_10_HI <- head(dge_global[order(dge_global$avg_log2FC, decreasing = TRUE), ], 10)
+print(top_10_HI)
+
+# Volver a poner los clusters como identificador por defecto (por si acaso)
+Idents(seu_merged) <- "seurat_clusters"
+```
+
+---
+
+
+## Guardado del objeto integrado
+
+```{r save_integrated}
+ruta_rds_integrado <- paste0(ruta_out, "seu_integrado_harmony.rds")
+saveRDS(seu_merged, file = ruta_rds_integrado)
+cat("Objeto integrado guardado en:", ruta_rds_integrado, "\n")
+cat("Células totales:", ncol(seu_merged), "\n")
+cat("Clusters:       ", length(unique(seu_merged$seurat_clusters)), "\n")
+```
+
+```{r export_pdf_integrado}
+ruta_pdf <- paste0(ruta_imagenes, "PDF_umaps_integrado.pdf")
+
+pdf(ruta_pdf, width = 14, height = 11)
+
+print(p_pre_muestra | p_pre_grupo)
+
+print((p1 | p2) / (p3 | p4))
+
+print(DimPlot(seu_merged, reduction = "umap", group.by = "SingleR.Monaco",
+              label = TRUE, label.size = 3, repel = TRUE) +
+  ggtitle("Anotación SingleR Monaco — integrado") +
+  theme(legend.position = "bottom") +
+  guides(color = guide_legend(ncol = 5, override.aes = list(size = 3))))
+
+dev.off()
+cat("PDF UMAPs guardado en:", ruta_pdf, "\n")
+```
+
+---
+
+## Resumen final
+
+```{r resumen_final}
+cat("══ RESUMEN DE INTEGRACIÓN ══════════════════════════════════\n")
+cat("Muestras integradas:    ", length(unique(seu_merged$orig.ident)), "\n")
+cat("Total células:          ", ncol(seu_merged), "\n")
+cat("Grupos:                 ", paste(unique(seu_merged$grupo), collapse = " | "), "\n")
+cat("Clusters (res", resolucion_final, "): ", length(unique(seu_merged$seurat_clusters)), "\n")
+cat("Genes analizados:       ", nrow(seu_merged), "\n")
+cat("PCs usados (Harmony):   ", paste(range(dims_harmony), collapse = "-"), "\n")
+cat("Theta Harmony:          ", theta_val, "\n")
+cat("────────────────────────────────────────────────────────────\n")
+cat("Célululas por muestra:\n")
+print(table(seu_merged$orig.ident))
+cat("────────────────────────────────────────────────────────────\n")
+cat("Células por grupo:\n")
+print(table(seu_merged$grupo))
+cat("════════════════════════════════════════════════════════════\n")
+```
+
+El objeto `seu_integrado_harmony.rds` contiene las 8 muestras integradas con Harmony y está listo para análisis diferenciales de composición celular (Control vs HI) y expresión diferencial por tipo celular.
+
+## Reclustering de monocitos
+
+```{r reclustering}
+# 1. Cargar objeto si no está de antes
+seu_completo <- readRDS("~/Documents/2_TFM_integracion/output/integracion/seu_integrado_harmony.rds")
+
+# 2. Definimos la condición A: Los clusters limpios (basado en el heatmap)
+clusters_mieloides <- c("1", "3", "9", "16", "24", "25", "26", "27")
+
+# 3. Definimos la condición B:etiquetas biológicas de interés 
+# (Revisa que el nombre de la columna sea exactamente el que usas para el Main label, ej: SingleR.Main)
+etiquetas_mieloides <- c("Monocytes", "Macrophages", "Dendritic cells", "Microglia", "Progenitors")
+
+# 4. El subset de DOBLE FILTRO (usando el símbolo &)
+cat("Extrayendo población mieloide con doble filtro \n")
+seu_mieloide <- subset(
+  seu_completo, 
+  subset = seurat_clusters %in% clusters_mieloides & SingleR.Monaco.Main %in% etiquetas_mieloides
+)
+
+# 5. Comprobar cuántas células nos han quedado finalmente
+cat(" Hay ", ncol(seu_mieloide), "células mieloides\n")
+
+# 6. Guardar el nuevo objeto
+saveRDS(seu_mieloide, file = "~/Documents/3_TFM_recluster_monocitos/seu_mieloide.rds")
+```

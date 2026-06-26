@@ -1,0 +1,756 @@
+---
+title: "DGE y Gene Ontology — Subpoblaciones Monocíticas"
+subtitle: "Análisis diferencial por tipo celular anotado (HI vs Control) · Sin muestra H9"
+author: "Celia Galiano Manzanares"
+date: '`r format(Sys.Date(), "%d de %B de %Y")`'
+output:
+  html_document:
+    theme: united
+    df_print: kable
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy      = TRUE,
+  tidy.opts = list(width.cutoff = 95),
+  message   = FALSE,
+  warning   = FALSE,
+  error     = TRUE
+)
+```
+
+> **Nota de uso:** Modificar únicamente el chunk `init`.  
+> El análisis se ejecuta **excluyendo la muestra H9**.  
+> Los resultados (DGE + GO + Excel) se guardan en la subcarpeta `sin_H9/`.
+
+---
+
+# PASO 1 — Carga del objeto mieloide
+
+```{r libraries}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(ggrepel)
+library(MAST)
+library(openxlsx)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(rrvgo)
+```
+
+```{r init}
+# ── PARÁMETROS A MODIFICAR ──────────────────────────────────────────────────────
+ruta_rds        <- "C:/Users/celia/Escritorio/TFM/workspace/seu_monocitos_integrado.rds"
+col_condicion   <- "grupo"       # columna con "HI" / "Control"
+col_celltipo    <- "cell_type"   # columna con el subtipo celular anotado
+col_muestra     <- "orig.ident"  # columna que identifica la muestra
+muestra_excluir <- "HI9_B6"      # muestra a excluir
+
+cells <- c(
+  "Classical monocytes",
+  "Non-classical monocytes",
+  "Intermediate monocytes",
+  "Myeloid DCs",
+  "Plasmacytoid DCs"
+)
+
+colores_celltypes <- c(
+  "Classical monocytes"     = "darkolivegreen1",
+  "Non-classical monocytes" = "#97FFFF",
+  "Intermediate monocytes"  = "lightgoldenrod1",
+  "Myeloid DCs"             = "orchid2",
+  "Plasmacytoid DCs"        = "wheat3",
+  "Platelet mix"            = "lightpink1"
+)
+
+ruta_base <- "C:/Users/celia/Escritorio/TFM/workspace/output/6_tablas_DGEs_GO/"
+
+rutas <- list(
+  sin_H9 = list(
+    dge  = paste0(ruta_base, "sin_H9/dge/"),
+    go   = paste0(ruta_base, "sin_H9/go/"),
+    xlsx = paste0(ruta_base, "sin_H9/")
+  )
+)
+
+for (esc in rutas) for (d in esc) if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+```
+
+```{r load_object}
+seu_full <- readRDS(ruta_rds)
+```
+
+```{r objeto_seurat}
+stopifnot(
+  "col_condicion no existe en @meta.data" = col_condicion %in% colnames(seu_full@meta.data),
+  "col_celltipo no existe en @meta.data"  = col_celltipo  %in% colnames(seu_full@meta.data),
+  "col_muestra no existe en @meta.data"   = col_muestra   %in% colnames(seu_full@meta.data)
+)
+
+seu_full <- JoinLayers(seu_full)
+
+muestras_disponibles <- unique(seu_full@meta.data[[col_muestra]])
+if (!muestra_excluir %in% muestras_disponibles) {
+  warning("La muestra '", muestra_excluir, "' no se encontró en la columna '", col_muestra,
+          "'.\nMuestras disponibles: ", paste(muestras_disponibles, collapse = ", "))
+}
+
+cells_noH9 <- colnames(seu_full)[seu_full@meta.data[[col_muestra]] != muestra_excluir]
+seu_noH9   <- subset(seu_full, cells = cells_noH9)
+
+# Vector de genes detectados en el dataset sin H9 (para universo GO)
+genes_dataset_noH9 <- rownames(seu_noH9)
+
+cat("── Objeto creado ───────────────────────────────────────────\n")
+cat("Sin H9  — Células totales:", ncol(seu_noH9), "\n")
+cat("Células excluidas (H9):   ", ncol(seu_full) - ncol(seu_noH9), "\n")
+cat("────────────────────────────────────────────────────────────\n")
+print(table(seu_noH9@meta.data[[col_muestra]], seu_noH9@meta.data[[col_condicion]]))
+
+# Liberar memoria del objeto completo
+rm(seu_full)
+gc()
+```
+
+```{r umap_check, fig.height=5, fig.width=7}
+p_ct_noH9 <- DimPlot(seu_noH9, reduction = "umap", group.by = col_celltipo,
+                     label = TRUE, repel = TRUE, cols = colores_celltypes) +
+  labs(title = "Cell Subtypes", subtitle = "Sample H9 Excluded") +
+  NoLegend()
+
+p_con_noH9 <- DimPlot(seu_noH9, reduction = "umap", group.by = col_condicion,
+                      cols = c("Control" = "#4e79a7", "HI" = "#e34459")) +
+  labs(title = "Clinical Condition", subtitle = "Sample H9 Excluded")
+
+p_ct_noH9 | p_con_noH9
+```
+
+---
+
+# PASO 2 — Expresión diferencial (DGE)
+
+```{r dge_helper}
+ejecutar_dge <- function(seu_obj, cells, col_celltipo, col_condicion, etiqueta = "") {
+
+  seu_obj$subtipo_condicion <- paste0(
+    seu_obj@meta.data[[col_celltipo]], "___",
+    seu_obj@meta.data[[col_condicion]]
+  )
+  Idents(seu_obj) <- "subtipo_condicion"
+  lista <- list()
+
+  for (ct in cells) {
+    id_hi      <- paste0(ct, "___HI")
+    id_control <- paste0(ct, "___Control")
+    n_hi      <- sum(seu_obj$subtipo_condicion == id_hi)
+    n_control <- sum(seu_obj$subtipo_condicion == id_control)
+
+    cat(sprintf("\n[%s] ▶ %s — HI: %d | Control: %d\n", etiqueta, ct, n_hi, n_control))
+
+    if (n_hi < 10 || n_control < 10) {
+      cat(sprintf("  ⚠ OMITIDO (< 10 células en algún grupo)\n")); next
+    }
+
+    dge_tmp <- tryCatch(
+      FindMarkers(seu_obj, ident.1 = id_hi, ident.2 = id_control,
+                  test.use = "MAST", min.pct = 0.1, logfc.threshold = 1,
+                  verbose = FALSE),
+      error = function(e) { message("  ✗ Error en ", ct, ": ", e$message); return(NULL) }
+    )
+
+    if (is.null(dge_tmp) || nrow(dge_tmp) == 0) { cat("  → Sin resultados\n"); next }
+
+    dge_tmp$p_val_fdr <- p.adjust(dge_tmp$p_val, method = "BH")
+    dge_tmp$gene      <- rownames(dge_tmp)
+    dge_tmp$celltype  <- ct
+    dge_tmp$direction <- ifelse(dge_tmp$avg_log2FC > 0, "UP_HI", "DOWN_HI")
+    dge_tmp           <- dge_tmp[order(dge_tmp$p_val_fdr), ]
+
+    n_sig <- sum(dge_tmp$p_val_fdr < 0.05, na.rm = TRUE)
+    cat(sprintf("  → Sig FDR<0.05: %d  [UP: %d | DOWN: %d]\n", n_sig,
+                sum(dge_tmp$p_val_fdr < 0.05 & dge_tmp$avg_log2FC > 0, na.rm = TRUE),
+                sum(dge_tmp$p_val_fdr < 0.05 & dge_tmp$avg_log2FC < 0, na.rm = TRUE)))
+
+    lista[[ct]] <- dge_tmp
+  }
+
+  cat(sprintf("\n[%s] Subtipos procesados: %d de %d\n", etiqueta, length(lista), length(cells)))
+  lista
+}
+```
+
+## Análisis SIN H9
+
+```{r dge_sin_H9}
+lista_dge_sinH9 <- ejecutar_dge(seu_noH9, cells, col_celltipo, col_condicion, etiqueta = "SIN H9")
+```
+
+## Tabla resumen DGE
+
+```{r tabla_resumen_dge}
+resumen_dge_fn <- function(lista, escenario) {
+  bind_rows(lapply(names(lista), function(ct) {
+    d <- lista[[ct]]
+    data.frame(
+      Escenario      = escenario,
+      Subtipo        = ct,
+      Genes_testados = nrow(d),
+      DEGs_FDR05     = sum(d$p_val_fdr < 0.05, na.rm = TRUE),
+      UP_en_HI       = sum(d$p_val_fdr < 0.05 & d$avg_log2FC > 0, na.rm = TRUE),
+      DOWN_en_HI     = sum(d$p_val_fdr < 0.05 & d$avg_log2FC < 0, na.rm = TRUE),
+      Top_gen_UP     = { up <- d[d$p_val_fdr < 0.05 & d$avg_log2FC > 0, ]
+                         if (nrow(up) > 0) up$gene[which.max(up$avg_log2FC)] else NA_character_ },
+      Top_gen_DOWN   = { dn <- d[d$p_val_fdr < 0.05 & d$avg_log2FC < 0, ]
+                         if (nrow(dn) > 0) dn$gene[which.min(dn$avg_log2FC)] else NA_character_ }
+    )
+  }))
+}
+
+resumen_sinH9 <- resumen_dge_fn(lista_dge_sinH9, "Sin H9")
+knitr::kable(resumen_sinH9,
+             caption = "Resumen DEGs — Sin H9 (MAST, FDR<0.05, |log2FC|≥1, min.pct=0.1)")
+```
+
+## Diagnóstico pct.1 — genes expresados en fracción baja de células {#diagnostico-pct1}
+
+Los genes con `pct.1 < 0.1` están expresados en menos del 10% de las células del grupo HI. Aunque sean estadísticamente significativos, aportan poca señal en el análisis GO porque representan subpoblaciones muy pequeñas. Esta tabla permite entender por qué un subtipo con muchos DEGs puede no producir términos GO enriquecidos.
+
+```{r diagnostico_pct1}
+diagnostico_pct1_fn <- function(lista_dge, escenario) {
+  bind_rows(lapply(names(lista_dge), function(ct) {
+    d <- lista_dge[[ct]] %>% filter(p_val_fdr < 0.05)
+    if (nrow(d) == 0) return(NULL)
+    data.frame(
+      Escenario          = escenario,
+      Subtipo            = ct,
+      DEGs_total         = nrow(d),
+      UP_pct1_gt10pct    = sum(d$avg_log2FC > 0 & d$pct.1 >= 0.1),
+      UP_pct1_lt10pct    = sum(d$avg_log2FC > 0 & d$pct.1 <  0.1),
+      DOWN_pct1_gt10pct  = sum(d$avg_log2FC < 0 & d$pct.1 >= 0.1),
+      DOWN_pct1_lt10pct  = sum(d$avg_log2FC < 0 & d$pct.1 <  0.1)
+    )
+  }))
+}
+
+diag_sinH9 <- diagnostico_pct1_fn(lista_dge_sinH9, "Sin H9")
+knitr::kable(diag_sinH9,
+             caption = "Diagnóstico pct.1: DEGs expresados en ≥10% vs <10% de células HI")
+```
+
+## Exportar Excel DGEs
+
+```{r exportar}
+exportar_excel_dge <- function(lista_dge, resumen_df, ruta_xlsx, nombre_base) {
+
+  estilo_header <- createStyle(fontColour = "#FFFFFF", fgFill = "#9F2AA9",
+                               halign = "CENTER", textDecoration = "Bold",
+                               border = "TopBottomLeftRight")
+  estilo_celda  <- createStyle(border = "TopBottomLeftRight", halign = "LEFT")
+  estilo_up     <- createStyle(fgFill = "#FBC4E4", border = "TopBottomLeftRight")
+  estilo_down   <- createStyle(fgFill = "#E1CEFF", border = "TopBottomLeftRight")
+
+  abreviar  <- function(nombre) trimws(substr(gsub("[^A-Za-z0-9 ]", "", nombre), 1, 31))
+  col_orden <- c("gene", "avg_log2FC", "p_val", "p_val_fdr", "pct.1", "pct.2",
+                 "celltype", "direction")
+  base      <- sub("\\.xlsx$", "", nombre_base)
+
+  construir_wb <- function(filtro_dir) {
+    wb <- createWorkbook()
+
+    # Resumen
+    if (filtro_dir == "ambos") {
+      resumen_filtrado <- resumen_df
+      for (i in 1:nrow(resumen_filtrado)) {
+        ct <- resumen_filtrado$Subtipo[i]
+        if (ct %in% names(lista_dge)) {
+          d <- lista_dge[[ct]]
+          if (!is.null(d) && nrow(d) > 0) {
+            resumen_filtrado$Top_gen_UP[i]   <- paste(head(d[d$p_val_fdr < 0.05 & d$direction == "UP_HI",   "gene"], 10), collapse = ", ")
+            resumen_filtrado$Top_gen_DOWN[i] <- paste(head(d[d$p_val_fdr < 0.05 & d$direction == "DOWN_HI", "gene"], 10), collapse = ", ")
+          }
+        }
+      }
+      colnames(resumen_filtrado)[colnames(resumen_filtrado) == "Top_gen_UP"]   <- "Top_10_Genes_UP"
+      colnames(resumen_filtrado)[colnames(resumen_filtrado) == "Top_gen_DOWN"] <- "Top_10_Genes_DOWN"
+    } else {
+      resumen_filtrado <- bind_rows(lapply(names(lista_dge), function(ct) {
+        d <- lista_dge[[ct]]
+        if (is.null(d) || nrow(d) == 0) return(NULL)
+        d_filt <- d %>% dplyr::filter(p_val_fdr < 0.05, direction == filtro_dir)
+        if (nrow(d_filt) == 0) return(NULL)
+        data.frame(Subtipo = ct, Total_DEGs = nrow(d_filt),
+                   Top_10_Genes = paste(head(d_filt$gene, 10), collapse = ", "))
+      }))
+    }
+
+    addWorksheet(wb, "Resumen")
+    writeData(wb, "Resumen", resumen_filtrado)
+    addStyle(wb, "Resumen", estilo_header, rows = 1,
+             cols = 1:ncol(resumen_filtrado), gridExpand = TRUE)
+    addStyle(wb, "Resumen", estilo_celda,
+             rows = 2:(nrow(resumen_filtrado) + 1),
+             cols = 1:ncol(resumen_filtrado), gridExpand = TRUE)
+    setColWidths(wb, "Resumen", cols = 1:ncol(resumen_filtrado), widths = "auto")
+
+    # Pestañas por subtipo
+    for (ct in names(lista_dge)) {
+      df_base <- lista_dge[[ct]]
+      if (is.null(df_base) || nrow(df_base) == 0) next
+      df_ct   <- df_base %>% dplyr::select(any_of(col_orden)) %>%
+                 mutate(across(where(is.numeric), ~ round(.x, 6)))
+      df_hoja <- if (filtro_dir == "ambos") df_ct else
+                 df_ct %>% dplyr::filter(p_val_fdr < 0.05, direction == filtro_dir)
+      if (is.null(df_hoja) || nrow(df_hoja) == 0) next
+
+      hoja <- abreviar(ct)
+      addWorksheet(wb, hoja)
+      writeData(wb, hoja, df_hoja)
+      addStyle(wb, hoja, estilo_header, rows = 1, cols = 1:ncol(df_hoja), gridExpand = TRUE)
+      addStyle(wb, hoja, estilo_celda,
+               rows = 2:(nrow(df_hoja) + 1), cols = 1:ncol(df_hoja), gridExpand = TRUE)
+
+      if (filtro_dir == "ambos") {
+        idx_up   <- which(df_hoja$p_val_fdr < 0.05 & df_hoja$avg_log2FC > 0) + 1
+        idx_down <- which(df_hoja$p_val_fdr < 0.05 & df_hoja$avg_log2FC < 0) + 1
+        if (length(idx_up)   > 0) addStyle(wb, hoja, estilo_up,   rows = idx_up,   cols = 1:ncol(df_hoja), gridExpand = TRUE)
+        if (length(idx_down) > 0) addStyle(wb, hoja, estilo_down, rows = idx_down, cols = 1:ncol(df_hoja), gridExpand = TRUE)
+      } else {
+        estilo_color <- if (filtro_dir == "UP_HI") estilo_up else estilo_down
+        addStyle(wb, hoja, estilo_color,
+                 rows = 2:(nrow(df_hoja) + 1), cols = 1:ncol(df_hoja), gridExpand = TRUE)
+      }
+      freezePane(wb, hoja, firstRow = TRUE)
+      setColWidths(wb, hoja, cols = 1:ncol(df_hoja), widths = "auto")
+    }
+    wb
+  }
+
+  archivos <- list(all  = paste0(base, "_all.xlsx"),
+                   UP   = paste0(base, "_UP.xlsx"),
+                   DOWN = paste0(base, "_DOWN.xlsx"))
+  filtros  <- list(all = "ambos", UP = "UP_HI", DOWN = "DOWN_HI")
+
+  for (nm in names(archivos)) {
+    wb_tmp    <- construir_wb(filtros[[nm]])
+    ruta_comp <- paste0(ruta_xlsx, archivos[[nm]])
+    saveWorkbook(wb_tmp, ruta_comp, overwrite = TRUE)
+    cat("Excel guardado:", ruta_comp, "\n")
+  }
+}
+```
+
+```{r guardar}
+exportar_excel_dge(lista_dge_sinH9, resumen_sinH9,
+                   rutas$sin_H9$xlsx, "DEGs_subtipos_HI_vs_Control_sinH9.xlsx")
+```
+## Heatmap
+
+```{r heatmap}
+# 1. Seleccionar los mejores genes marcadores (Top 10 por cada clúster)
+# Filtramos los que tengan p_val_fdr < 0.05 y elegimos los 10 con mayor avg_log2FC
+top10_genes <- lista_dge_sinH9 %>%
+  bind_rows(.id = "Cluster") %>%
+  filter(p_val_fdr < 0.05) %>%
+  group_by(Cluster) %>%
+  top_n(n = 10, wt = avg_log2FC) %>%
+  pull(gene) %>%
+  unique()
+
+# 2. Hacer un "downsample" temporal de células para el gráfico
+# Si pintamos miles de células el heatmap se vuelve negro y no se lee nada.
+# Elegimos un máximo de 100 células por clúster al azar para que quede impecable.
+seu_sub_plot <- subset(seu_noH9, max.cells.per.ident = 100)
+
+# 3. Escalar los datos SOLO para los genes del top10 (esto calcula el Z-score automáticamente)
+seu_sub_plot <- ScaleData(seu_sub_plot, features = top10_genes)
+
+# 4. Generar el Heatmap con Z-score integrado
+p_heatmap <- DoHeatmap(
+  object = seu_sub_plot, 
+  features = top10_genes, 
+  size = 3.5,           # Tamaño de la letra de los genes
+  draw.lines = TRUE,    # Separa visualmente los clústeres con barras arriba
+  angle = 0             # Deja los nombres de los clústeres horizontales y legibles
+) +
+  # Tuneamos la escala de colores clásica: Azul (DOWN), Blanco (Media), Rojo (UP)
+  scale_fill_gradient2(low = "#1F77B4", mid = "white", high = "#D62728", midpoint = 0, name = "Z-score") +
+  theme(
+    axis.text.y = element_text(size = 9, face = "italic"), # Genes en cursiva y legibles
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5)
+  )
+
+# 5. Mostrar en el informe
+print(p_heatmap)
+
+# 6. Guardar automáticamente en tu carpeta en formato .jpg de alta calidad
+nombre_archivo_hm <- "heatmap_top10_DEGs_monocitos.jpg"
+ruta_final_hm <- file.path(ruta_base, nombre_archivo_hm)
+
+ggsave(filename = ruta_final_hm, plot = p_heatmap, width = 10, height = 8, dpi = 300)
+```
+
+## Volcano plots — Sin H9
+
+```{r volcano_sinH9, fig.height=5, fig.width=7, results='asis'}
+make_volcano <- function(dge_df, titulo) {
+  dge_plot <- dge_df %>%
+    mutate(sig = p_val_fdr < 0.05,
+           color_grp = case_when(sig & avg_log2FC >  0 ~ "UP HI",
+                                 sig & avg_log2FC <  0 ~ "DOWN HI",
+                                 TRUE                  ~ "ns"))
+  top_lab <- dge_plot %>% filter(sig) %>% arrange(p_val_fdr) %>% head(12)
+
+  ggplot(dge_plot, aes(x = avg_log2FC, y = -log10(p_val_fdr), color = color_grp)) +
+    geom_point(alpha = 0.55, size = 1.2) +
+    scale_color_manual(values = c("UP HI" = "#D62728", "DOWN HI" = "#1F77B4", "ns" = "grey70")) +
+    geom_text_repel(data = top_lab, aes(label = gene), size = 2.8, max.overlaps = 20,
+                    show.legend = FALSE) +
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey40", linewidth = 0.4) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40", linewidth = 0.4) +
+    labs(title = titulo, x = "avg log2 FC (HI vs Control)", y = "-log10(FDR)", color = "") +
+    theme_classic(base_size = 10) +
+    theme(plot.title = element_text(size = 10, face = "bold"))
+}
+
+for (ct in names(lista_dge_sinH9)) {
+  cat(sprintf("\n### %s\n\n", ct))
+  p_sin <- make_volcano(lista_dge_sinH9[[ct]])
+  print(p_sin)
+}
+
+for (ct in names(lista_dge_sinH9)) {
+  cat(sprintf("\n### %s\n\n", ct))
+  
+  # 1. Generar el gráfico en memoria
+  p_sin <- make_volcano(lista_dge_sinH9[[ct]], titulo="")
+
+  print(p_sin)
+  
+  # 3. GUARDADO AUTOMÁTICO: Limpiamos el nombre del tipo celular para el archivo
+  nombre_archivo <- paste0("volcano_", gsub(" ", "_", ct), ".jpg")
+  ruta_final <- file.path(ruta_base, nombre_archivo)
+  
+  # Guardamos cada volcán con las medidas exactas que te pide tu tutora
+  ggsave(filename = ruta_final, plot = p_sin, width = 7, height = 5, dpi = 300)
+}
+```
+
+---
+
+# PASO 3 — Gene Ontology (GO BP) con reducción semántica
+
+El enriquecimiento GO se ejecuta con **universo en cascada**: primero se usa el universo específico del subtipo (genes testados en ese DGE); si no produce términos significativos, se repite con todos los genes detectados en el dataset; si sigue sin resultados, se usa el genoma completo anotado. La columna `universo_usado` en los resultados indica qué universo produjo los términos.
+
+```{r go_helpers}
+# ── Función 1: enriquecimiento GO con universo configurable ──────────────────
+run_go <- function(genes_input, universo_entrez = NULL,
+                   fdr_cutoff = 0.05, etiqueta = "GO") {
+
+  if (length(genes_input) == 0) {
+    message("[", etiqueta, "] Sin genes de entrada."); return(NULL)
+  }
+
+  entrez_map <- suppressMessages(
+    bitr(genes_input, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  )
+  n_mapeados <- nrow(entrez_map)
+  n_total    <- length(unique(genes_input))
+  cat(sprintf("  [%s] Input: %d | Mapeados: %d | Descartados: %d\n",
+              etiqueta, n_total, n_mapeados, n_total - n_mapeados))
+
+  if (n_mapeados < 5) {
+    message("  [", etiqueta, "] < 5 genes mapeados → GO omitido."); return(NULL)
+  }
+
+  ego <- enrichGO(
+    gene          = entrez_map$ENTREZID,
+    universe      = universo_entrez,   # NULL = genoma completo
+    OrgDb         = org.Hs.eg.db,
+    ont           = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = fdr_cutoff,
+    qvalueCutoff  = fdr_cutoff,
+    readable      = TRUE
+  )
+
+  if (is.null(ego) || nrow(as.data.frame(ego)) == 0) {
+    message("  [", etiqueta, "] Sin términos GO significativos."); return(NULL)
+  }
+
+  cat(sprintf("  [%s] Términos GO sig: %d\n", etiqueta, nrow(as.data.frame(ego))))
+  ego
+}
+
+# ── Función 2: cascada de universos ──────────────────────────────────────────
+# Intenta primero universo específico → dataset → genoma
+run_go_cascada <- function(genes_input, universo_especifico_symbols,
+                           genes_dataset_symbols,
+                           fdr_cutoff = 0.05, etiqueta = "GO") {
+
+  # Convertir universos a Entrez una sola vez
+  univ_esp <- suppressMessages(
+    bitr(universo_especifico_symbols, fromType = "SYMBOL", toType = "ENTREZID",
+         OrgDb = org.Hs.eg.db)
+  )$ENTREZID
+
+  univ_ds  <- suppressMessages(
+    bitr(genes_dataset_symbols, fromType = "SYMBOL", toType = "ENTREZID",
+         OrgDb = org.Hs.eg.db)
+  )$ENTREZID
+
+  # 1. Universo específico del subtipo
+  ego <- run_go(genes_input, universo_entrez = univ_esp, fdr_cutoff = fdr_cutoff,
+                etiqueta = paste0(etiqueta, " [univ:especifico]"))
+  if (!is.null(ego)) { attr(ego, "universo_usado") <- "especifico"; return(ego) }
+
+  # 2. Universo: todos los genes del dataset
+  cat(sprintf("  [%s] Sin resultados con universo específico → probando universo dataset\n",
+              etiqueta))
+  ego <- run_go(genes_input, universo_entrez = univ_ds, fdr_cutoff = fdr_cutoff,
+                etiqueta = paste0(etiqueta, " [univ:dataset]"))
+  if (!is.null(ego)) { attr(ego, "universo_usado") <- "dataset"; return(ego) }
+
+  # 3. Sin restricción de universo (genoma completo anotado)
+  cat(sprintf("  [%s] Sin resultados con universo dataset → probando genoma completo\n",
+              etiqueta))
+  ego <- run_go(genes_input, universo_entrez = NULL, fdr_cutoff = fdr_cutoff,
+                etiqueta = paste0(etiqueta, " [univ:genoma]"))
+  if (!is.null(ego)) attr(ego, "universo_usado") <- "genoma"
+  ego
+}
+
+# ── Función 3: reducción semántica con rrvgo ─────────────────────────────────
+reducir_go <- function(ego, umbral_sim = 0.7, etiqueta = "GO") {
+
+  df_go <- as.data.frame(ego)
+  if (nrow(df_go) == 0) return(NULL)
+
+  sim_mat <- calculateSimMatrix(df_go$ID, orgdb = org.Hs.eg.db,
+                                ont = "BP", method = "Rel")
+  scores  <- setNames(-log10(df_go$p.adjust), df_go$ID)
+  grupos  <- reduceSimMatrix(sim_mat, scores, threshold = umbral_sim,
+                             orgdb = "org.Hs.eg.db")
+
+  cat(sprintf("  [%s] Reducción: %d → %d términos representativos\n",
+              etiqueta, nrow(df_go), length(unique(grupos$parentTerm))))
+
+  df_go$parent_GO   <- grupos$parent[match(df_go$ID, grupos$go)]
+  df_go$parent_term <- grupos$parentTerm[match(df_go$ID, grupos$go)]
+
+  list(df_full    = df_go,
+       df_reduced = df_go[df_go$ID == df_go$parent_GO, ],
+       grupos     = grupos,
+       sim_mat    = sim_mat)
+}
+
+# ── Función 4: bucle GO completo para un escenario ───────────────────────────
+ejecutar_go <- function(lista_dge, genes_dataset, ruta_go, etiqueta_esc) {
+
+  lista_go_out <- list()
+
+  for (ct in names(lista_dge)) {
+
+    dge_ct      <- lista_dge[[ct]]
+    universo_ct <- dge_ct$gene   # genes testados en ese subtipo
+    genes_up    <- dge_ct %>% filter(p_val_fdr < 0.05, avg_log2FC > 0) %>% pull(gene)
+    genes_down  <- dge_ct %>% filter(p_val_fdr < 0.05, avg_log2FC < 0) %>% pull(gene)
+
+    for (dir in c("UP", "DOWN")) {
+
+      genes_dir <- if (dir == "UP") genes_up else genes_down
+      etiq      <- paste0(gsub(" ", "_", ct), "_", dir, "_HI_", etiqueta_esc)
+      dir_label <- ifelse(dir == "UP", "UP en HI", "DOWN en HI")
+
+      ego <- run_go_cascada(genes_dir,
+                            universo_especifico_symbols = universo_ct,
+                            genes_dataset_symbols       = genes_dataset,
+                            etiqueta = etiq)
+      if (is.null(ego)) next
+
+      universo_final <- attr(ego, "universo_usado")
+      cat(sprintf("  ✓ [%s] Universo usado: %s\n", etiq, universo_final))
+
+      res_red <- reducir_go(ego, umbral_sim = 0.7, etiqueta = etiq)
+      if (is.null(res_red)) next
+
+      # Añadir columna con el universo que produjo resultado
+      res_red$df_full$universo_usado <- universo_final
+
+      lista_go_out[[paste0(ct, "___", dir)]] <- res_red$df_full
+
+      # ── Dotplot reducido (PDF + inline) ──────────────────────────────────
+      ids_padres     <- res_red$df_reduced$ID
+      ego_red        <- ego
+      ego_red@result <- ego@result[ego@result$ID %in% ids_padres, ]
+      n_show         <- min(20, nrow(ego_red@result))
+
+      if (n_show > 0) {
+        p_dot <- dotplot(ego_red, showCategory = n_show) +
+          ggtitle(paste0("GO BP (", etiqueta_esc, ") — ", ct, " | ", dir_label,
+                         " [universo: ", universo_final, "]")) +
+          theme(plot.title = element_text(size = 9, face = "bold"),
+                axis.text.y = element_text(size = 8))
+        ggsave(paste0(ruta_go, "GO_", gsub(" ", "_", ct), "_", dir, "_dotplot.pdf"),
+               p_dot, width = 13, height = max(5, n_show * 0.42 + 2))
+        print(p_dot)
+      }
+
+      # ── Plot combinado UP+DOWN (solo cuando se acaben ambas direcciones) ──
+      lista_go_out[[paste0(ct, "___", dir, "___ego_red")]] <- ego_red
+
+      # ── Treemap (PDF) ────────────────────────────────────────────────────
+      pdf(paste0(ruta_go, "GO_", gsub(" ", "_", ct), "_", dir, "_treemap.pdf"),
+          width = 12, height = 8)
+      treemapPlot(res_red$grupos)
+      dev.off()
+    }
+
+    # ── Plot combinado UP + DOWN en un mismo gráfico ──────────────────────
+    key_up   <- paste0(ct, "___UP___ego_red")
+    key_down <- paste0(ct, "___DOWN___ego_red")
+
+    if (!is.null(lista_go_out[[key_up]]) && !is.null(lista_go_out[[key_down]])) {
+
+      ego_up_red   <- lista_go_out[[key_up]]
+      ego_down_red <- lista_go_out[[key_down]]
+
+      df_up   <- as.data.frame(ego_up_red)   %>% mutate(direction = "UP en HI")
+      df_down <- as.data.frame(ego_down_red) %>% mutate(direction = "DOWN en HI")
+      df_comb <- bind_rows(df_up, df_down) %>%
+        mutate(direction = factor(direction, levels = c("UP en HI", "DOWN en HI")),
+               GeneRatio_num = sapply(GeneRatio, function(x) {
+                 nums <- as.numeric(strsplit(x, "/")[[1]]); nums[1] / nums[2]
+               }))
+
+      p_comb <- ggplot(df_comb,
+                       aes(x = GeneRatio_num, y = reorder(Description, GeneRatio_num),
+                           size = Count, color = p.adjust)) +
+        geom_point(alpha = 0.85) +
+        facet_wrap(~ direction, scales = "free_y") +
+        scale_color_gradient(low = "#D62728", high = "#AAAAAA",
+                             name = "FDR") +
+        scale_size_continuous(name = "Gene count", range = c(2, 8)) +
+        labs(title = paste0("GO BP (reducido) — ", ct, " | sinH9"),
+             x = "Gene Ratio", y = NULL) +
+        theme_bw(base_size = 10) +
+        theme(plot.title    = element_text(size = 10, face = "bold"),
+              axis.text.y   = element_text(size = 10),
+              strip.text    = element_text(face = "bold"))
+
+      print(p_comb)
+      ggsave(paste0(ruta_go, "GO_", gsub(" ", "_", ct), "_UP_DOWN_combinado.jpg"),
+             p_comb, width = 12, height = max(5, nrow(df_comb) * 0.3 + 3))
+    }
+
+    # Limpiar claves auxiliares de ego_red (no necesarias en el Excel)
+    lista_go_out[[key_up]]   <- NULL
+    lista_go_out[[key_down]] <- NULL
+  }
+
+  lista_go_out
+}
+```
+
+## GO — Sin H9
+
+```{r go_sin_H9, fig.height=7, fig.width=13}
+lista_go_sinH9 <- ejecutar_go(lista_dge_sinH9,
+                              genes_dataset  = genes_dataset_noH9,
+                              ruta_go        = rutas$sin_H9$go,
+                              etiqueta_esc   = "sinH9")
+```
+
+## Exportar Excel GO — Sin H9
+
+```{r export_excel_go}
+exportar_excel_go <- function(lista_go, ruta_xlsx, nombre_archivo) {
+
+  estilo_header_go <- createStyle(fontColour = "#FFFFFF", fgFill = "#1E6B3A",
+                                  halign = "CENTER", textDecoration = "Bold",
+                                  border = "TopBottomLeftRight")
+  estilo_padre <- createStyle(fgFill = "#D6F0DC", border = "TopBottomLeftRight",
+                              textDecoration = "Bold")
+  estilo_hijo  <- createStyle(fgFill = "#FFFFFF", border = "TopBottomLeftRight")
+
+  wb_go <- createWorkbook()
+
+  resumen_go <- bind_rows(lapply(names(lista_go), function(nm) {
+    partes <- strsplit(nm, "___")[[1]]
+    df     <- lista_go[[nm]]
+    data.frame(
+      Subtipo          = partes[1],
+      Direccion        = partes[2],
+      Universo_usado   = if ("universo_usado" %in% colnames(df))
+                           unique(df$universo_usado)[1] else NA_character_,
+      Terminos_totales = nrow(df),
+      Terminos_padres  = sum(df$ID == df$parent_GO, na.rm = TRUE)
+    )
+  }))
+
+  addWorksheet(wb_go, "Resumen_GO")
+  writeData(wb_go, "Resumen_GO", resumen_go)
+  addStyle(wb_go, "Resumen_GO", estilo_header_go,
+           rows = 1, cols = 1:ncol(resumen_go), gridExpand = TRUE)
+  setColWidths(wb_go, "Resumen_GO", cols = 1:ncol(resumen_go), widths = "auto")
+
+  col_go <- c("ID", "Description", "parent_GO", "parent_term", "universo_usado",
+              "GeneRatio", "BgRatio", "pvalue", "p.adjust", "Count", "geneID")
+
+  for (nm in names(lista_go)) {
+    partes  <- strsplit(nm, "___")[[1]]
+    hoja_go <- paste0(substr(gsub("[^A-Za-z0-9]", "", partes[1]), 1, 22), "_", partes[2])
+
+    addWorksheet(wb_go, hoja_go)
+
+    df_hoja <- lista_go[[nm]] %>%
+      dplyr::select(any_of(col_go)) %>%
+      arrange(parent_term, p.adjust) %>%
+      mutate(across(where(is.numeric), ~ round(.x, 6)))
+
+    writeData(wb_go, hoja_go, df_hoja)
+    addStyle(wb_go, hoja_go, estilo_header_go,
+             rows = 1, cols = 1:ncol(df_hoja), gridExpand = TRUE)
+
+    df_orig   <- lista_go[[nm]] %>% dplyr::select(any_of(col_go)) %>%
+                 arrange(parent_term, p.adjust)
+    idx_padre <- which(df_orig$ID == df_orig$parent_GO) + 1
+    idx_hijo  <- setdiff(2:(nrow(df_hoja) + 1), idx_padre)
+
+    if (length(idx_padre) > 0)
+      addStyle(wb_go, hoja_go, estilo_padre,
+               rows = idx_padre, cols = 1:ncol(df_hoja), gridExpand = TRUE)
+    if (length(idx_hijo) > 0)
+      addStyle(wb_go, hoja_go, estilo_hijo,
+               rows = idx_hijo, cols = 1:ncol(df_hoja), gridExpand = TRUE)
+
+    setColWidths(wb_go, hoja_go, cols = 1:ncol(df_hoja), widths = "auto")
+  }
+
+  ruta_completa <- paste0(ruta_xlsx, nombre_archivo)
+  saveWorkbook(wb_go, ruta_completa, overwrite = TRUE)
+  cat("Excel GO guardado en:", ruta_completa, "\n")
+}
+
+exportar_excel_go(lista_go_sinH9, rutas$sin_H9$xlsx,
+                  "GO_BP_subtipos_HI_vs_Control_sinH9.xlsx")
+```
+
+---
+
+# Resumen de archivos generados
+
+```{r resumen_archivos}
+cat("── Sin H9 ───────────────────────────────────────────────────\n")
+cat("Excel:\n"); cat(list.files(rutas$sin_H9$xlsx, pattern = "\\.xlsx$"), sep = "\n")
+cat("\nPDFs GO:\n"); cat(list.files(rutas$sin_H9$go, pattern = "\\.pdf$"), sep = "\n")
+cat("────────────────────────────────────────────────────────────\n")
+```

@@ -1,0 +1,1064 @@
+---
+title: "Integración de muestras scRNA-seq con Harmony — Subpoblaciones de Monocitos"
+subtitle: "Muestras: C1_B3, C2_B8, HI1_B1, HI3_B2, HI4_B4, HI8_B5, HI9_B6"
+author: "Celia Galiano Manzanares"
+date: '`r format(Sys.Date(), "%d de %B de %Y")`'
+output:
+  html_document:
+    theme: united
+    df_print: kable
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy      = TRUE,
+  tidy.opts = list(width.cutoff = 95),
+  message   = FALSE,
+  warning   = FALSE,
+  error     = TRUE
+)
+```
+
+> **Nota de uso:** Este script toma el objeto Seurat de monocitos (`seu_mono.rds`) generado en el script de integración general y realiza un re-análisis específico: renormalización, PCA, Harmony y clustering optimizado para resolver las subpoblaciones de monocitos clásicos, no clásicos e intermedios. Los parámetros `dims_harmony` y `resolucion_final` pueden requerir ajuste manual tras inspeccionar el ElbowPlot y el clustree.
+
+---
+
+## Setup y parámetros
+
+```{r libraries}
+library(Seurat)
+library(harmony)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(clustree)
+library(SingleR)
+library(celldex)
+library(tidyr)
+library(pheatmap)
+library(scales)
+library(EnhancedVolcano)
+```
+
+```{r init}
+# ── RUTAS ──────────────────────────────────────────────────────────────────────
+ruta_base  <- "C:/Users/celia/Escritorio/TFM/workspace/"
+ruta_workspace <- "./"
+ruta_rds_mono   <- paste0(ruta_workspace, "seu_mieloide.rds")
+ruta_out        <- paste0(ruta_base, "output/")
+ruta_imagenes   <- paste0(ruta_out, "imagenes_reclustering/")
+
+
+# Crear carpetas de salida si no existen
+for (d in c(ruta_out, ruta_imagenes)) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+}
+
+# Grupos de las muestras
+grupo_map <- c(
+  C1_B3   = "Control",
+  C2_B8   = "Control",
+  HI1_B1  = "HI",
+  HI3_B2  = "HI",
+  HI4_B4  = "HI",
+  HI8_B5  = "HI",
+  HI9_B6  = "HI"
+)
+
+# Subtipos de monocitos esperados tras el re-análisis
+tipos_mieloides <- c(
+  "Classical monocytes", 
+  "Intermediate monocytes", 
+  "Non classical monocytes", 
+  "Macrophages",
+  "Dendritic cells", 
+  "Microglia",
+  "Progenitors"
+)
+
+# 2. Paleta de colores 
+colores_mieloides <- c(
+  "Classical monocytes"     = "#e34459", 
+  "Intermediate monocytes"  = "#f4a261", 
+  "Non classical monocytes" = "#4e79a7", 
+  "Macrophages"             = "#2ca02c", 
+  "Dendritic cells"         = "#9467bd", 
+  "Microglia"               = "#8c564b", 
+  "Progenitors"             = "#bcbd22"  
+)
+
+cat("Rutas configuradas:\n")
+cat("  RDS monocitos: ", ruta_rds_mono, "\n")
+cat("  Salida:        ", ruta_out,     "\n")
+```
+
+---
+
+## Carga del objeto de monocitos
+
+```{r load_monocitos}
+if (!file.exists(ruta_rds_mono)) {
+  stop("Archivo no encontrado: ", ruta_rds_mono,"\n")
+}
+
+seu_mono <- readRDS(ruta_rds_mono)
+
+# Asegurar que el metadato de grupo está presente
+if (!"grupo" %in% colnames(seu_mono@meta.data)) {
+  seu_mono@meta.data$grupo <- unname(grupo_map[seu_mono@meta.data$orig.ident])
+}
+
+cat("── Resumen del objeto de monocitos ─────────────────────────\n")
+cat("Células totales:    ", ncol(seu_mono), "\n")
+cat("Genes:              ", nrow(seu_mono), "\n")
+cat("Muestras:           ", paste(unique(seu_mono$orig.ident), collapse = ", "), "\n")
+cat("────────────────────────────────────────────────────────────\n")
+```
+
+```{r load_summary, fig.height=5, fig.width=10}
+# Distribución de células por muestra y grupo
+tabla_carga <- seu_mono@meta.data %>%
+  group_by(orig.ident, grupo) %>%
+  summarise(
+    n_celulas     = n(),
+    genes_mediana = round(median(nFeature_RNA)),
+    UMIs_mediana  = round(median(nCount_RNA)),
+    MT_mediana    = round(median(percent.MT), 2),
+    .groups = "drop"
+  ) %>%
+  arrange(grupo, orig.ident)
+
+cat("── Células por muestra ─────────────────────────────────────\n")
+print(tabla_carga)
+
+p_composition_sample <- ggplot(tabla_carga, aes(x = orig.ident, y = n_celulas, fill = grupo)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("Control" = "#4e79a7", "HI" = "#e34459")) +
+  labs(title = NULL,
+       x = NULL, y = "Número de células (monocitos)", fill = "Group") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(paste0(ruta_imagenes, "Composition_monocytes_sample.jpg"), plot = (p_composition_sample), width = 12, height = 8)
+print(p_composition_sample)
+```
+
+Si la anotación de SingleR ya está disponible en el objeto, se muestra la distribución de subtipos heredada de la integración general:
+
+```{r subtypes_inherited, fig.height=5, fig.width=10}
+if ("SingleR.Mono.Fine" %in% colnames(seu_mono@meta.data)) {
+  tabla_subtipos <- seu_mono@meta.data %>%
+    group_by(SingleR.Mono.Fine, grupo) %>%
+    summarise(n = n(), .groups = "drop")
+
+  p_composition_sample_cells <- ggplot(tabla_subtipos, aes(x = SingleR.Mono.Fine, y = n, fill = grupo)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    scale_fill_manual(values = c("Control" = "#4e79a7", "HI" = "#e34459")) +
+    labs(title = NULL,
+         x = NULL, y = "Número de células", fill = "Group") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+} else {
+  cat("La columna SingleR.Mono.Fine no está presente en el objeto. Se omite esta visualización.\n")
+}
+
+ggsave(paste0(ruta_imagenes, "Composition_type_monocytes_sample.jpg"), plot = p_composition_sample, width = 12, height = 14)
+print(p_composition_sample_cells)
+```
+
+
+---
+
+## QC del subconjunto de monocitos
+
+```{r qc_mono_violin, fig.height=6, fig.width=13}
+# Inspección visual de las métricas de calidad en el subconjunto de monocitos
+plot_genes  <- VlnPlot(seu_mono, features = "nFeature_RNA", group.by = "orig.ident",
+                       pt.size = 0) + ylim(0, 6000) + NoLegend() + ggtitle(NULL)
+plot_counts <- VlnPlot(seu_mono, features = "nCount_RNA",   group.by = "orig.ident",
+                       pt.size = 0) + ylim(0, 30000) + NoLegend() + ggtitle(NULL)
+plot_mito   <- VlnPlot(seu_mono, features = "percent.MT",   group.by = "orig.ident",
+                       pt.size = 0) + ylim(0, 10) + NoLegend() + ggtitle(NULL)
+
+plot_genes | plot_counts | plot_mito
+
+ggsave(paste0(ruta_imagenes, "QC_monocytes_violin_notitle.jpg"), plot = (plot_genes | plot_counts | plot_mito), width = 14, height = 5)
+```
+
+Verificar que no existen células de baja calidad (pocos genes, alto % MT) que hayan escapado del filtrado previo y que el QC es comparable entre muestras.
+
+---
+
+## Preprocesamiento del subconjunto de monocitos (pre-Harmony)
+
+El subconjunto de monocitos proviene del objeto integrado, que ya fue normalizado. Sin embargo, se **renormaliza y recalcula el PCA** sobre este subconjunto porque los genes variables y el espacio PCA óptimo para resolver subpoblaciones de monocitos difieren del espacio PCA global: al eliminar el resto de tipos celulares, los PCs globales capturan ahora variabilidad técnica o biológica irrelevante para la separación monocítica.
+
+```{r preprocess_mono}
+cat("Normalizando...\n")
+seu_mono <- NormalizeData(seu_mono, normalization.method = "LogNormalize",
+                          scale.factor = 1e4, verbose = FALSE)
+
+cat("Identificando genes variables...\n")
+seu_mono <- FindVariableFeatures(seu_mono, selection.method = "vst",
+                                 nfeatures = 2000, verbose = FALSE)
+
+cat("Escalando...\n")
+seu_mono <- ScaleData(seu_mono, verbose = FALSE)
+
+cat("Calculando PCA...\n")
+seu_mono <- RunPCA(seu_mono, npcs = 30, verbose = FALSE)
+
+gc()
+```
+
+```{r top_hvg, fig.height=5, fig.width=10}
+# Top 10 genes variables en el subconjunto de monocitos
+top10 <- head(VariableFeatures(seu_mono), 10)
+plot1 <- VariableFeaturePlot(seu_mono)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2
+```
+
+En el subconjunto de monocitos, entre los genes más variables es esperable encontrar marcadores de activación monocítica (CD14, FCGR3A/CD16, S100A8, S100A9), genes de respuesta inflamatoria (TNF, IL1B, CXCL8) y genes relacionados con el estado de maduración (CX3CR1, CCR2).
+
+```{r pca_viz_mono, fig.height=8, fig.width=10}
+print(seu_mono[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(seu_mono, dims = 1:2, reduction = "pca")
+```
+
+```{r elbow_mono, fig.height=5, fig.width=8}
+ElbowPlot(seu_mono, ndims = 30) +
+  ggtitle("ElbowPlot — Subconjunto de monocitos (pre-Harmony)")
+```
+
+> **⚠️ Nota:** Inspeccionar el ElbowPlot antes de fijar `dims_harmony`. En subconjuntos de un único linaje celular, el codo suele aparecer más temprano (típicamente entre 10 y 15 PCs) que en el objeto global.
+
+```{r dims_set_mono}
+# ── PARÁMETRO A AJUSTAR SEGÚN EL ELBOWPLOT ─────────────────────────────────────
+dims_harmony <- 1:15   
+# ────────────────────────────────────────────────────────────────────────────────
+cat("dims_harmony fijados:", paste(range(dims_harmony), collapse = "-"), "\n")
+```
+
+```{r umap_preharmony_mono, fig.height=8, fig.width=16}
+# UMAP pre-Harmony para visualizar el efecto de batch ANTES de corregirlo
+seu_mono <- RunUMAP(seu_mono, dims = dims_harmony,
+                    reduction.name = "umap.preharmony", verbose = FALSE)
+
+p_pre_muestra <- DimPlot(seu_mono, reduction = "umap.preharmony",
+                          group.by = "orig.ident", label = FALSE) +
+  ggtitle(NULL)+
+  theme(legend.position = "right")
+
+p_pre_grupo <- DimPlot(seu_mono, reduction = "umap.preharmony",
+                        group.by = "grupo",
+                        cols = c("Control" = "#4e79a7", "HI" = "#e34459")) +
+  ggtitle(NULL)+
+  theme(legend.position = "right")
+
+p_pre_muestra | p_pre_grupo
+ggsave(paste0(ruta_imagenes, "UMAP_preharmony_moncytes_notitle.jpg"), plot = (p_pre_muestra / p_pre_grupo), width = 12, height = 14)
+```
+
+Si las células de distintas muestras aparecen segregadas en el UMAP pre-Harmony, indica efecto batch que Harmony corregirá. Si la segregación coincide con grupos biológicos (Control vs HI), interpretar con cautela antes de aplicar Harmony doble.
+
+---
+
+## Integración con Harmony
+
+```{r harmony_mono, fig.height=5, fig.width=8}
+# ── PARÁMETROS DE HARMONY ───────────────────────────────────────────────────────
+theta_val    <- 2    # Fuerza de corrección: 1–2 estándar; subir si el batch es fuerte
+lambda_val   <- 1    # Regularización estándar
+max_iter_val <- 10   # Iteraciones máximas
+# ────────────────────────────────────────────────────────────────────────────────
+
+t0 <- Sys.time()
+cat("Harmony corrigiendo por muestra...\n")
+seu_mono <- RunHarmony(
+  seu_mono,
+  group.by.vars    = "orig.ident",
+  dims.use         = dims_harmony,
+  theta            = theta_val,
+  lambda           = lambda_val,
+  max_iter         = max_iter_val,
+  plot_convergence = TRUE,
+  verbose          = TRUE
+)
+
+t1 <- Sys.time()
+gc()
+```
+
+---
+
+## Clustering y UMAP post-Harmony. Reducción por muestra
+
+```{r post_harmony_clustering_mono}
+# ── PARÁMETROS POST-HARMONY ─────────────────────────────────────────────────────
+resolucion_final <- 0.4   # En subconjuntos de un único linaje se recomienda empezar
+                           # con resoluciones bajas (0.2–0.6) para evitar fragmentación.
+#aJUSTAR CON EL CLUSTREE QUE SE HACE LUEGO
+# ────────────────────────────────────────────────────────────────────────────────
+
+cat("Calculando UMAP post-Harmony...\n")
+seu_mono <- RunUMAP(seu_mono,
+                    reduction      = "harmony",
+                    dims           = dims_harmony,
+                    reduction.name = "umap",
+                    verbose        = FALSE)
+
+cat("Calculando vecinos...\n")
+seu_mono <- FindNeighbors(seu_mono,
+                          reduction = "harmony",
+                          dims      = dims_harmony,
+                          verbose   = FALSE)
+
+cat("Clustering (resolución", resolucion_final, ")...\n")
+seu_mono <- FindClusters(seu_mono,
+                         resolution = resolucion_final,
+                         verbose    = FALSE)
+
+cat("Número de clusters:", length(unique(seu_mono$seurat_clusters)), "\n")
+gc()
+```
+
+```{r umap_postharmony_mono, fig.height=16, fig.width=16}
+p1 <- DimPlot(seu_mono, reduction = "umap", group.by = "seurat_clusters",
+              label = TRUE, label.size = 4) +
+  ggtitle(NULL) +
+  theme(legend.position = "none")
+
+p2 <- DimPlot(seu_mono, reduction = "umap", group.by = "orig.ident") +
+  ggtitle(NULL) +
+  theme(legend.position = "right")
+
+p3 <- DimPlot(seu_mono, reduction = "umap", group.by = "grupo",
+              cols = c("Control" = "#4e79a7", "HI" = "#e34459")) +
+  ggtitle(NULL) +
+  theme(legend.position = "right")
+
+p4 <- FeaturePlot(seu_mono, reduction = "umap", features = "nFeature_RNA") +
+  ggtitle(NULL)
+
+(p1 | p2) / (p3 | p4)
+ggsave(paste0(ruta_imagenes, "UMAP_postharmony_moncytes_notitle.jpg"), plot = (p1 | p2) / (p3 | p4), width = 16, height = 18)
+```
+
+**Criterios de calidad del UMAP post-Harmony:**
+
+- Las células de distintas muestras deben estar mezcladas dentro de cada cluster.
+- Los grupos Control y HI deben solaparse en los subtipos compartidos.
+- Se esperan 3 regiones bien diferenciadas en el UMAP, correspondientes a los monocitos clásicos (CD14++CD16−), intermedios (CD14++CD16+) y no clásicos (CD14+CD16++).
+
+### Control de integración — mezcla por muestra
+
+```{r mixing_check_mono, fig.height=5, fig.width=10}
+composicion <- seu_mono@meta.data %>%
+  group_by(seurat_clusters, orig.ident, grupo) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(seurat_clusters) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  arrange(seurat_clusters, orig.ident)
+
+composicion_wide <- composicion %>%
+  select(seurat_clusters, orig.ident, pct) %>%
+  tidyr::pivot_wider(names_from = orig.ident, values_from = pct, values_fill = 0)
+
+cat("Composición (%) por muestra en cada cluster:\n")
+print(composicion_wide)
+
+p_mixing_mono <-ggplot(composicion, aes(x = seurat_clusters, y = pct, fill = orig.ident)) +
+    geom_bar(stat = "identity", position = "stack", color = "white", linewidth = 0.2) +
+    
+    geom_text(aes(label = ifelse(pct > 3, paste0(pct, "%"), "")),
+              position = position_stack(vjust = 0.5), 
+              size = 3, fontface = "bold", color = "black") +
+    
+    scale_y_continuous(labels = function(x) paste0(x, "%")) +
+    labs(x = "Monocyte cluster", 
+         y = "% of células", 
+         fill = "Sample") +
+    theme_classic() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "black"),
+      axis.text.y = element_text(size = 10, color = "black"),
+      axis.title  = element_text(size = 11, face = "bold")
+    )
+print(p_mixing_mono)
+ggsave(paste0(ruta_imagenes, "Cluster_composition_monocytes_posthar,mony.jpg"),
+       plot = p_mixing_mono, width = 10, height = 8)
+```
+
+```{r mixing_grupo_mono, fig.height=5, fig.width=10}
+ggplot(composicion, aes(x = seurat_clusters, y = pct, fill = grupo)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("Control" = "#4e79a7", "HI" = "#e34459")) +
+  labs(title = "Composición por grupo (Control vs HI) en cada cluster (monocitos)",
+       x = "Cluster", y = "Proportion", fill = "Condition") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(paste0(ruta_imagenes, "Cluster_composition_sample_monocytes_postharmony.jpg"),
+       plot = p_mixing_mono, width = 10, height = 8)
+```
+```{r individuo_vs_sample}
+
+# ── 1. GRÁFICO DE INDIVIDUOS vs TIPO CELULAR ──────────────────────────────────
+
+p_ind_tipo <- ggplot(seu_mono@meta.data, aes(x = orig.ident, fill = SingleR.Mono.Fine)) +
+  # position = "fill" es la magia para que todas las barras lleguen al 100%
+  geom_bar(position = "fill", color = "white", linewidth = 0.2) +
+  scale_y_continuous(labels = percent) + # Transforma 0.5 en 50%
+  labs(x = "Sample", 
+       y = "Cell proportion", 
+       fill = "Cell type") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, face = "bold", color = "black"),
+        axis.text.y = element_text(color = "black"))
+
+print(p_ind_tipo)
+
+ggsave(paste0(ruta_imagenes, "Barplot_Individuos_vs_TipoCelular.jpg"), 
+       plot = p_ind_tipo, width = 8, height = 6, dpi = 300)
+
+
+# ── 2. GRÁFICO DE INDIVIDUOS vs CLUSTER MATEMÁTICO ────────────────────────────
+# Hacemos lo mismo, pero cambiamos el color (fill) a los clusters
+p_ind_cluster <- ggplot(seu_mono@meta.data, aes(x = orig.ident, fill = factor(seurat_clusters))) +
+  geom_bar(position = "fill", color = "white", linewidth = 0.2) +
+  scale_y_continuous(labels = percent) +
+  labs(x = "Sample", 
+       y = "Cell proportion", 
+       fill = "Cluster") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, face = "bold", color = "black"),
+        axis.text.y = element_text(color = "black"))
+
+print(p_ind_cluster)
+
+ggsave(paste0(ruta_imagenes, "Barplot_Individuos_vs_Cluster.jpg"), 
+       plot = p_ind_cluster, width = 8, height = 6, dpi = 300)
+       
+```
+
+---
+
+## Selección de resolución con clustree
+
+```{r clustree_mono, fig.height=12, fig.width=10}
+library(clustree)
+
+# Clustree sobre Harmony 
+seu_mono <- FindNeighbors(seu_mono,
+                          reduction  = "harmony",
+                          dims       = dims_harmony,
+                          graph.name = "harmony_snn",
+                          verbose    = FALSE)
+
+seu_mono <- FindClusters(seu_mono,
+                         resolution = c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8),
+                         graph.name = "harmony_snn",
+                         verbose    = FALSE)
+
+clustree(seu_mono, prefix = "harmony_snn_res.") +
+  ggtitle("Clustree — Monocitos (Harmony)") +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+```
+
+> **Guía de interpretación:** En un subconjunto de monocitos se esperan 3–5 clusters estables. Una resolución que produzca exactamente 3 clusters bien definidos (sin flechas cruzadas) corresponde probablemente a la separación clásicos / intermedios / no clásicos. Resoluciones más altas pueden revelar subpoblaciones activadas o estados transitorios biológicamente relevantes. POr eso elegimos resolución 0.4
+
+
+```{r cluster_final_mono}
+resolucion_final <- 0.4
+# ────────────────────────────────────────────────────────────────────────────────
+
+# Recalcular con la resolución elegida sobre Harmony Normal (reducción principal)
+seu_mono <- FindNeighbors(seu_mono,
+                          reduction = "harmony",
+                          dims      = dims_harmony,
+                          verbose   = FALSE)
+
+seu_mono <- FindClusters(seu_mono,
+                         resolution = resolucion_final,
+                         verbose    = FALSE)
+
+Idents(seu_mono) <- "seurat_clusters"
+cat("Resolución aplicada:", resolucion_final, "\n")
+cat("Número de clusters:", length(unique(seu_mono$seurat_clusters)), "\n")
+```
+
+---
+
+## Marcadores diferenciales por cluster
+
+```{r markers_mono}
+seu_mono <- JoinLayers(seu_mono)
+
+n_clusters <- length(unique(seu_mono$seurat_clusters))
+cat("Calculando marcadores para", n_clusters, "clusters...\n")
+
+if (n_clusters > 1) {
+  markers_mono <- FindAllMarkers(
+    seu_mono,
+    only.pos          = TRUE,
+    min.pct           = 0.25,
+    logfc.threshold   = 0.25,
+    max.cells.per.ident = 2000,
+    verbose           = FALSE
+  )
+
+  # 2. Guarda la tabla gigante
+  write.csv(markers_mono, 
+            file = "output/Markers_all_monocytes.csv", 
+            row.names = FALSE)
+  cat("Tabla completa guardada en: output/Markers_all_monocytes.csv\n")
+
+  top5_mono_tabla <- markers_mono %>%
+    group_by(cluster) %>%
+    filter(avg_log2FC > log2(1.5)) %>%
+    slice_max(n = 5, order_by = avg_log2FC) %>%
+    ungroup() 
+  
+  write.csv(top5_mono_tabla, 
+            file = "output/Markers_Top5_monocytes.csv", 
+            row.names = FALSE)
+  cat("Tabla Top 5 guardada en: output/Markers_Top5_monocytes.csv\n")
+  
+  print(knitr::kable(top5_mono_tabla, caption = "Top 5 marcadores por cluster de monocitos"))
+  
+} else {
+  message("Solo hay 1 cluster — FindAllMarkers no es aplicable.")
+}
+```
+
+```{r dotplot_markers_mono, fig.width=12, fig.height=6}
+
+
+genes_dotplot <- unique(top5_mono_tabla$gene)
+
+# 2. Dibujamos el DotPlot
+p_dotplot_mono <- DotPlot(seu_mono, 
+                          features = genes_dotplot, 
+                          group.by = "seurat_clusters") +
+  
+  # Le damos un degradado de color (de gris claro a rojo fuerte)
+  scale_color_gradient(low = "lightgrey", high = "#E64B35") +
+  
+  # Cero títulos principales, solo etiquetamos los ejes
+  labs(x = "Top 5 markers",
+       y = "Cluster ") +
+  
+  theme_classic() +
+  theme(
+    # Giramos los nombres de los genes 45 grados y en cursiva (face = "italic")
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "black", face = "italic"),
+    axis.text.y = element_text(size = 11, color = "black", face = "bold"),
+    legend.position = "right"
+  )
+
+print(p_dotplot_mono)
+
+# 3. Guardamos la gráfica
+ggsave(paste0(ruta_imagenes, "DotPlot_Top5_Marcadores_Mono.jpg"),
+       plot = p_dotplot_mono, width = 12, height = 6, dpi = 300)
+```
+
+```{r feature_plots_mono_canonical, fig.height=10, fig.width=12}
+# Marcadores canónicos de los tres subtipos de monocitos
+# CD14 y S100A8/S100A9: monocitos clásicos
+# FCGR3A (CD16), CX3CR1: monocitos no clásicos
+# CD64 (FCGR1A): monocitos intermedios
+# SELL: monocitos clásicos e intermedios
+# HLA-DR (HLA-DRA, HLA-DRB1): todos los monocitos; mayor en intermedios/no clásicos
+
+p_markes_monocytes <- FeaturePlot(seu_mono, reduction = "umap",
+            features = c("CD14", "FCGR3A", "CX3CR1",
+                         "S100A8", "S100A9", "SELL",
+                         "HLA-DRA", "FCGR1A", "CCR2"),
+            ncol = 3) 
+print(p_markes_monocytes)
+ggsave(paste0(ruta_imagenes, "markers_monocytes_notitle.jpg"),
+       plot = p_markes_monocytes, width = 10, height = 8)
+```
+
+Referencia para interpretación manual:
+
+| Marcadores                          | Subtipo                       |
+|-------------------------------------|-------------------------------|
+| CD14++, FCGR3A−, S100A8+, CCR2+    | Monocitos clásicos            |
+| CD14+, FCGR3A++, CX3CR1+, SELL−    | Monocitos no clásicos         |
+| CD14++, FCGR3A+, HLA-DRA++, FCGR1A++ | Monocitos intermedios       |
+
+```{r feature_plots_mono_plaquetas, fig.height=10, fig.width=12}
+
+# Lista de genes  específicos de plaqueta
+genes_plaquetarios <- c("PF4", "PPBP")
+
+comprobacion_plaquetas <- markers_mono %>%
+  filter(gene %in% genes_plaquetarios)
+
+print(comprobacion_plaquetas)
+
+p_markes_plaquets <- FeaturePlot(seu_mono, reduction = "umap",
+            features = genes_plaquetarios,
+            ncol = 2) 
+print(p_markes_plaquets)
+
+```
+
+```{r violin_mono_canonical, fig.height=8, fig.width=14}
+p_violin_marker <- VlnPlot(seu_mono, features = c("CD14", "FCGR3A", "CX3CR1", "S100A8", "PPBP", "NKG7", "MS4A1", "LEF1"),
+        pt.size = 0, ncol = 4) +
+  plot_annotation(title = "Violines de marcadores canónicos — subpoblaciones monocíticas")
+ggsave(paste0(ruta_imagenes, "violin_markers_monocytes.jpg"),
+       plot = p_violin_marker, width = 10, height = 6)
+```
+
+```{r dotplot_mono, fig.height=5, fig.width=10}
+p_dotplot_markers <- DotPlot(seu_mono,
+        features = c("CD14", "FCGR3A", "CX3CR1", "S100A8", "S100A9","HLA-DRA", "FCGR1A", "CCR2", "SELL", "ITGAM", "PF4", "PPBP", "MS4A1", "LEF1", "NKG7")) +
+  RotatedAxis() +
+  ggtitle("DotPlot de marcadores monocíticos por cluster") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.background = element_rect(fill = "white", color = NA),  
+    panel.background = element_rect(fill = "white", color = NA)  
+  )
+ggsave(paste0(ruta_imagenes, "dotplot_markers.jpg"),
+       plot = p_dotplot_markers, width = 10, height = 8, bg = "white")
+
+print(p_dotplot_markers)
+```
+
+---
+
+## Anotación automática con SingleR (subconjunto de monocitos)
+
+Se re-ejecuta SingleR sobre el subconjunto de monocitos para obtener anotaciones de mayor resolución, ya que la referencia Monaco puede asignar subtipos con más confianza al no tener que competir con el resto de linajes.
+
+```{r singler_mono, fig.height=10, fig.width=10}
+cat("Cargando referencia Monaco...\n")
+ref.monaco <- MonacoImmuneData()
+
+datos_mono <- GetAssayData(seu_mono, assay = "RNA", layer = "data")
+
+cat("Anotando a nivel detallado (label.fine)...\n")
+predictions_fine_mono <- SingleR(
+  test   = datos_mono,
+  ref    = ref.monaco,
+  labels = ref.monaco$label.fine
+)
+
+cat("Anotando a nivel general (label.main)...\n")
+predictions_main_mono <- SingleR(
+  test   = datos_mono,
+  ref    = ref.monaco,
+  labels = ref.monaco$label.main
+)
+
+seu_mono[["SingleR.Mono.Fine"]] <- predictions_fine_mono$labels
+seu_mono[["SingleR.Mono.Main"]] <- predictions_main_mono$labels
+
+cat("Distribución de anotaciones fine:\n")
+print(sort(table(seu_mono$SingleR.Mono.Fine), decreasing = TRUE))
+
+tabla_fine <- table(seu_mono$seurat_clusters, seu_mono$SingleR.Mono.Fine)
+tabla_main <- table(seu_mono$seurat_clusters, seu_mono$SingleR.Mono.Main)
+df_excel_fine <- as.data.frame.matrix(tabla_fine)
+df_excel_main <- as.data.frame.matrix(tabla_main)
+write.csv(df_excel_fine, file = paste0(ruta_out, "Tabla_SingleR_Fine_por_Cluster.csv"))
+write.csv(df_excel_main, file = paste0(ruta_out, "Tabla_SingleR_Main_por_Cluster.csv"))
+```
+
+```{r umap_singler_mono_fine, fig.height=10, fig.width=10}
+DimPlot(seu_mono, reduction = "umap", group.by = "SingleR.Mono.Fine",
+        label = TRUE, label.size = 3.5, repel = TRUE) +
+  ggtitle("Anotación SingleR — Monocitos (Monaco label.fine)") +
+  theme(
+    plot.title      = element_text(hjust = 0.5, size = 13),
+    legend.position = "bottom",
+    legend.text     = element_text(size = 9)
+  ) +
+  guides(color = guide_legend(ncol = 3, override.aes = list(size = 3)))
+```
+
+```{r umap_singler_mono_main, fig.height=10, fig.width=10}
+DimPlot(seu_mono, reduction = "umap", group.by = "SingleR.Mono.Main",
+        label = TRUE, label.size = 3.5, repel = TRUE) +
+  ggtitle("Anotación SingleR — Monocitos (Monaco label.main)") +
+  theme(
+    plot.title      = element_text(hjust = 0.5, size = 13),
+    legend.position = "bottom",
+    legend.text     = element_text(size = 9)
+  ) +
+  guides(color = guide_legend(ncol = 3, override.aes = list(size = 3)))
+```
+
+```{r singler_scores_mono, fig.height=6, fig.width=10}
+plotScoreHeatmap(predictions_fine_mono,
+                 show.pruned = TRUE,
+                 annotation_col = data.frame(
+                   Cluster = seu_mono$seurat_clusters,
+                   row.names = colnames(seu_mono)))
+```
+
+### Concordancia cluster Seurat vs anotación SingleR
+
+```{r concordancia_mono_completa}
+concordancia_mono_completa <- seu_mono@meta.data %>%
+  select(seurat_clusters, SingleR.Mono.Fine) %>%
+  group_by(seurat_clusters, SingleR.Mono.Fine) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(seurat_clusters) %>%
+  mutate(pct = round((n / sum(n)) * 100, 1)) %>%
+  arrange(seurat_clusters, desc(n)) 
+
+cat("Anotación COMPLETA por cluster (Monaco fine):\n")
+print(concordancia_mono_completa, n = Inf) 
+```
+
+```{r barplot_composicion_clusters_mono, fig.width=10, fig.height=7}
+# 1. Tabla de composición por cluster
+tabla_composicion_mono <- seu_mono@meta.data %>%
+  filter(!is.na(SingleR.Mono.Fine)) %>%
+  group_by(seurat_clusters, SingleR.Mono.Fine) %>%
+  summarise(Cantidad = n(), .groups = "drop") %>%
+  group_by(seurat_clusters) %>%
+  mutate(Porcentaje = round((Cantidad / sum(Cantidad)) * 100, 1)) %>%
+  ungroup()
+
+cat("Tabla de composición por cluster:\n")
+print(knitr::kable(tabla_composicion_mono))
+
+write.csv(tabla_composicion_mono, 
+          file = paste0(ruta_out, "Tabla_Composicion_Clusters_Mono.csv"), 
+          row.names = FALSE)
+
+# 2. Paleta con los nombres EXACTOS y LITERALES de tus datos
+colores_mieloides <- c(
+  "Classical monocytes"          = "#e34459", 
+  "Intermediate monocytes"       = "#f4a261", 
+  "Non classical monocytes"      = "#4e79a7", 
+  "Myeloid dendritic cells"      = "#9467bd", 
+  "Plasmacytoid dendritic cells" = "#8c564b", 
+  "Progenitor cells"             = "#bcbd22", 
+  "Macrophages"                  = "#2ca02c", 
+  "Microglia"                    = "#ff7f0e", 
+  "Low-density neutrophils"      = "#7f7f7f", 
+  "Low-density basophils"        = "#c7c7c7"  
+)
+
+# 3. Dibujamos el gráfico
+p_barras_mono <- ggplot(tabla_composicion_mono, 
+       aes(x = factor(seurat_clusters), y = Porcentaje, fill = SingleR.Mono.Fine)) +
+  
+  geom_bar(stat = "identity", position = "stack", color = "white", linewidth = 0.3) +
+  
+  geom_text(aes(label = ifelse(Porcentaje > 4, 
+                               paste0(Cantidad, "\n(", Porcentaje, "%)"), 
+                               "")),
+            position = position_stack(vjust = 0.5), 
+            size = 3.2, fontface = "bold", color = "black") +
+  
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  scale_fill_manual(values = colores_mieloides) +
+  
+  labs(x = "Cluster", 
+       y = "% cells", 
+       fill = "Cell subtype (Monaco Fine)") +
+  
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(size = 12, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 11, color = "black"),
+    axis.title  = element_text(size = 12, face = "bold"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 10),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+print(p_barras_mono)
+
+# Guardamos con fondo blanco para asegurar nitidez
+ggsave(paste0(ruta_imagenes, "Barplot_Composicion_Clusters_Mono.jpg"),
+       plot = p_barras_mono, width = 11, height = 8, dpi = 300, bg = "white")
+
+```
+
+
+```{r barplot_proporcion_individuos, fig.width=10, fig.height=7}
+# Calculamos la tabla de frecuencias y el total por cada muestra (individuo)
+tabla_ind_composicion <- seu_mono@meta.data %>%
+  filter(!is.na(SingleR.Mono.Fine)) %>%
+  group_by(orig.ident, SingleR.Mono.Fine) %>%
+  summarise(Cantidad = n(), .groups = "drop") %>%
+  group_by(orig.ident) %>%
+  mutate(
+    Total_Individuo = sum(Cantidad),
+    Porcentaje = round((Cantidad / Total_Individuo) * 100, 1) # Sacamos el % relativo
+  ) %>%
+  ungroup()
+
+tabla_totales_ind <- tabla_ind_composicion %>%
+  select(orig.ident, Total_Individuo) %>%
+  distinct()
+
+p_ind_proporcion <- ggplot(tabla_ind_composicion, 
+                           aes(x = orig.ident, y = Cantidad, fill = SingleR.Mono.Fine)) +
+  
+  geom_bar(stat = "identity", position = "fill", color = "white", linewidth = 0.3) +
+  geom_text(aes(label = ifelse(Porcentaje > 5, paste0(Porcentaje, "%"), "")), 
+            position = position_fill(vjust = 0.5), # Centra el texto en su respectiva banda
+            size = 3, 
+            fontface = "bold", 
+            color = "black") +
+  # PONER EL TOTAL ARRIBA: Usamos la tabla auxiliar y fijamos y = 1 (el tope de la barra)
+  geom_text(data = tabla_totales_ind, 
+            aes(x = orig.ident, y = 1, label = paste0("N = ", Total_Individuo)),
+            inherit.aes = FALSE, # Evita que busque la columna SingleR.Mono.Fine en esta tabla
+            vjust = -0.5,        # Sube el texto un poco por encima de la barra
+            fontface = "bold", 
+            size = 3.5, 
+            color = "black") +
+  
+  # Formateamos el eje Y para que muestre % y le damos aire arriba para que el texto no se corte
+  scale_y_continuous(labels = percent_format(), expand = expansion(mult = c(0, 0.08))) +
+  scale_fill_manual(values = colores_mieloides) +
+  
+  labs(x = "Samples", 
+       y = "Cell proportion", 
+       fill = "Cell subtype (Monaco Fine)") +
+  
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(size = 11, color = "black", face = "bold", angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 11, color = "black"),
+    axis.title  = element_text(size = 12, face = "bold"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 10),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+print(p_ind_proporcion)
+
+# Guardamos el gráfico en alta resolución
+ggsave(paste0(ruta_imagenes, "Barplot_Proportion_Mieloide_Samples.jpg"),
+       plot = p_ind_proporcion, width = 11, height = 8, dpi = 300, bg = "white")
+```
+
+---
+
+## Análisis de composición: Control vs HI
+
+```{r composition_mono, fig.height=6, fig.width=12}
+# Proporción de cada subtipo en cada grupo
+composicion_grupos_mono <- seu_mono@meta.data %>%
+  group_by(grupo, SingleR.Mono.Fine) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(grupo) %>%
+  mutate(pct = round(n / sum(n) * 100, 2)) %>%
+  arrange(grupo, desc(pct))
+
+ggplot(composicion_grupos_mono, aes(x = SingleR.Mono.Fine, y = pct, fill = grupo)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Control" = "#4e79a7", "HI" = "#e34459")) +
+  labs(title = NULL,
+       x = NULL, y = "% cells", fill = "Group") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9))
+
+ggsave(paste0(ruta_imagenes, "Barplot_Composicion_Mono_notitle.jpg"),
+       plot = p_barras_mono, width = 10, height = 7, dpi = 300)
+```
+
+```{r composition_table_mono}
+composicion_wide_mono <- composicion_grupos_mono %>%
+  select(grupo, SingleR.Mono.Fine, pct) %>%
+  tidyr::pivot_wider(names_from = grupo, values_from = pct, values_fill = 0) %>%
+  mutate(diff_HI_vs_Control = round(HI - Control, 2)) %>%
+  arrange(desc(abs(diff_HI_vs_Control)))
+
+cat("Diferencias de composición monocítica HI vs Control:\n")
+print(composicion_wide_mono)
+
+write.csv(composicion_wide_mono,
+          file = paste0(ruta_out, "composicion_monocitos_HI_vs_Control.csv"),
+          row.names = FALSE)
+```
+
+```{r composition_by_cluster, fig.height=6, fig.width=12}
+# Proporción de cada grupo en cada cluster de monocitos
+composicion_cluster_mono <- seu_mono@meta.data %>%
+  group_by(seurat_clusters, grupo) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(seurat_clusters) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+ggplot(composicion_cluster_mono, aes(x = seurat_clusters, y = pct, fill = grupo)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("Control" = "#4e79a7", "HI" = "#e34459")) +
+  labs(title = "Proporción Control vs HI por cluster de monocitos",
+       x = "Cluster", y = "Proportion", fill = "Condition") +
+  theme_classic()
+```
+
+---
+
+## QC post-análisis
+
+```{r qc_post_mono, fig.height=6, fig.width=13}
+plot_genes_post  <- VlnPlot(seu_mono, features = "nFeature_RNA", pt.size = 0) +
+  ylim(0, 6000) + NoLegend() + ggtitle("Genes — post-análisis")
+plot_counts_post <- VlnPlot(seu_mono, features = "nCount_RNA",   pt.size = 0) +
+  ylim(0, 30000) + NoLegend() + ggtitle("UMIs — post-análisis")
+plot_mito_post   <- VlnPlot(seu_mono, features = "percent.MT",   pt.size = 0) +
+  ylim(0, 10) + NoLegend() + ggtitle("% MT — post-análisis")
+
+plot_genes_post | plot_counts_post | plot_mito_post
+```
+
+Verificar que los clusters finales tienen distribuciones de QC comparables, sin grupos dominados por métricas de baja calidad.
+
+---
+
+## Paneles — Figura monocitos
+
+```{r paneles_mono, fig.height=8, fig.width=12}
+panel_a <- DimPlot(seu_mono, reduction = "umap", group.by = "seurat_clusters",
+                   label = TRUE, label.size = 5) +
+  ggtitle(NULL) +
+  theme(legend.position = "none")
+
+print(panel_a)
+ggsave(paste0(ruta_imagenes, "Panel_A_UMAP_clusters.jpg"),
+       plot = panel_a, width = 7, height = 6)
+
+# ── PANEL B: UMAP por anotación SingleR ──────────────────────────────────────
+panel_b <- DimPlot(seu_mono, reduction = "umap", group.by = "SingleR.Mono.Fine",
+                   label = TRUE, label.size = 3.5, repel = TRUE) +
+  ggtitle(NULL) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 9)) +
+  guides(color = guide_legend(ncol = 3, override.aes = list(size = 3)))
+
+print(panel_b)
+ggsave(paste0(ruta_imagenes, "Panel_B_UMAP_anotacion.jpg"),
+       plot = panel_b, width = 9, height = 8)
+
+panel_b2 <- DimPlot(seu_mono, reduction = "umap", group.by = "SingleR.Mono.Main",
+                   label = TRUE, label.size = 3.5, repel = TRUE) +
+  ggtitle(NULL) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 9)) +
+  guides(color = guide_legend(ncol = 3, override.aes = list(size = 3)))
+
+print(panel_b2)
+ggsave(paste0(ruta_imagenes, "Panel_B_UMAP_anotacion_MAIN.jpg"),
+       plot = panel_b2, width = 9, height = 8)
+
+
+# ── PANEL C: UMAP por condición ───────────────────────────────────────────────
+panel_c <- DimPlot(seu_mono, reduction = "umap", group.by = "grupo",
+                   cols = c("Control" = "#4e79a7", "HI" = "#e34459")) +
+  ggtitle(NULL) +
+  theme(legend.position = "right")
+
+print(panel_c)
+ggsave(paste0(ruta_imagenes, "Panel_C_UMAP_condicion.jpg"),
+       plot = panel_c, width = 7, height = 6)
+
+# ── PANEL D: FeaturePlot marcadores canónicos ─────────────────────────────────
+panel_d <- FeaturePlot(seu_mono, reduction = "umap",
+                       features = c("CD14", "FCGR3A", "CX3CR1", "HLA-DRA"),
+                       ncol = 2) +
+  plot_annotation(title = NULL)
+
+print(panel_d)
+ggsave(paste0(ruta_imagenes, "Panel_D_FeaturePlot_marcadores.jpg"),
+       plot = panel_d, width = 10, height = 8)
+```
+
+```{r panel_qc_mono}
+# ── PANEL E: QC por muestra ───────────────────────────────────────────────────
+panel_e <- VlnPlot(seu_mono,
+                   features = c("nFeature_RNA", "nCount_RNA", "percent.MT"),
+                   group.by = "orig.ident", 
+                   pt.size  = 0, ncol = 3) +
+           plot_annotation(title = NULL)
+
+print(panel_e)
+ggsave(paste0(ruta_imagenes, "Panel_E_QC_monocitos.jpg"),
+       plot = panel_e, width = 12, height = 5)
+```
+
+---
+
+## Guardado del objeto final de monocitos
+
+```{r save_mono}
+ruta_rds_mono_final <- paste0(ruta_out, "seu_mono_integrado.rds")
+saveRDS(seu_mono, file = ruta_rds_mono_final)
+cat("Objeto de monocitos integrado guardado en:", ruta_rds_mono_final, "\n")
+cat("Células totales:", ncol(seu_mono), "\n")
+cat("Clusters:       ", length(unique(seu_mono$seurat_clusters)), "\n")
+```
+
+```{r export_pdf_mono}
+ruta_pdf_mono <- paste0(ruta_imagenes, "PDF_umaps_monocitos.pdf")
+
+pdf(ruta_pdf_mono, width = 14, height = 11)
+
+print(p_pre_muestra | p_pre_grupo)
+
+print((p1 | p2) / (p3 | p4))
+
+print(DimPlot(seu_mono, reduction = "umap", group.by = "SingleR.Mono.Fine",
+              label = TRUE, label.size = 3, repel = TRUE) +
+  ggtitle("Anotación SingleR Monaco — monocitos integrados") +
+  theme(legend.position = "bottom") +
+  guides(color = guide_legend(ncol = 3, override.aes = list(size = 3))))
+
+dev.off()
+cat("PDF UMAPs guardado en:", ruta_pdf_mono, "\n")
+
+```
+
+---
+
+## Resumen final
+
+```{r resumen_mono}
+cat("══ RESUMEN DE INTEGRACIÓN — MONOCITOS ════════════════════════\n")
+cat("Muestras integradas:      ", length(unique(seu_mono$orig.ident)), "\n")
+cat("Total células monocitos:  ", ncol(seu_mono), "\n")
+cat("Grupos:                   ", paste(unique(seu_mono$grupo), collapse = " | "), "\n")
+cat("Clusters (res", resolucion_final, "):   ", length(unique(seu_mono$seurat_clusters)), "\n")
+cat("PCs usados (Harmony):     ", paste(range(dims_harmony), collapse = "-"), "\n")
+cat("Theta Harmony:            ", theta_val, "\n")
+cat("──────────────────────────────────────────────────────────────\n")
+cat("Células por muestra:\n")
+print(table(seu_mono$orig.ident))
+cat("──────────────────────────────────────────────────────────────\n")
+cat("Células por grupo:\n")
+print(table(seu_mono$grupo))
+cat("──────────────────────────────────────────────────────────────\n")
+cat("Subtipos (SingleR.Mono.Fine):\n")
+print(sort(table(seu_mono$SingleR.Mono.Fine), decreasing = TRUE))
+cat("══════════════════════════════════════════════════════════════\n")
+```
+```{r guardar}
+saveRDS(seu_mono, file = paste0(ruta_base, "seu_monocitos_integrado.rds"))
+```
+
+El objeto `seu_mono_integrado.rds` contiene el subconjunto de monocitos integrado con Harmony, con las subpoblaciones clásicas, intermedias y no clásicas resueltas mediante re-clustering específico. 

@@ -1,0 +1,277 @@
+---
+title: "Pseudobulk_Monocitos"
+subtitle: "Analisis pseudobulk de monocitos (sin diferenciar subtipos) - sin H9"
+author: "Celia Galiano Manzanares"
+date: '`r format(Sys.Date(), "%d de %B de %Y")`'
+output:
+  html_document:
+    theme: united
+    df_print: kable
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  error = TRUE
+)
+```
+
+> **Nota:** Este script parte del objeto de monocitos ya reclusterizado e integrado (`seu_mono_final.rds`, escenario `sin_H9`). Realiza un analisis pseudobulk a nivel de muestra (sin diferenciar entre subtipos de monocitos), con heatmap de correlacion/distancia entre muestras y PCA para evaluar la separacion por condicion.
+
+# Librerias y parametros
+
+```{r libraries}
+library(Seurat)
+library(DESeq2)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+```
+
+```{r init}
+# ── RUTAS ──────────────────────────────────────────────────────────────────
+ruta_workspace <- "C:/Users/celia/Escritorio/TFM/workspace/"
+ruta_rds_mono  <- paste0(ruta_workspace, "seu_monocitos_integrado.rds")
+
+ruta_out          <- paste0(ruta_workspace, "output/7_pseudobulk/")
+ruta_imagenes     <- paste0(ruta_out, "images/")
+ruta_excel        <- paste0(ruta_out, "tables/")
+
+for (d in c(ruta_out, ruta_imagenes, ruta_excel)) {
+  if (!dir.exists(d)) {
+    dir.create(d, recursive = TRUE)
+    cat("Carpeta creada:", d, "\n")
+  }
+}
+
+# ── METADATA ───────────────────────────────────────────────────────────────
+col_muestra   <- "orig.ident"   # identifica la muestra individual
+col_condicion <- "grupo"        # identifica HIE vs control
+```
+
+# Carga del objeto
+
+```{r load_data}
+seu_mono <- readRDS(ruta_rds_mono)
+
+cat("Objeto cargado:", ncol(seu_mono), "celulas,", nrow(seu_mono), "genes\n")
+cat("Muestras presentes:\n")
+print(table(seu_mono@meta.data[[col_muestra]]))
+cat("\nCondiciones presentes:\n")
+print(table(seu_mono@meta.data[[col_condicion]]))
+
+# Comprobacion de si la muestra HI9_B6 esta presente en el objeto cargado.
+# Si el .rds apuntado en ruta_rds_mono corresponde al escenario "con_H9"
+# (objeto integrado completo), se filtra aqui mismo para dejar el resto
+# del script funcionando siempre sobre el escenario sin_H9.
+if (any(grepl("HI9", seu_mono@meta.data[[col_muestra]]))) {
+  cat("\nLa muestra HI9_B6 esta presente en el objeto cargado -> se filtra a continuacion.\n")
+  seu_mono <- subset(seu_mono, subset = orig.ident != "HI9_B6")
+  cat("Celulas tras excluir HI9_B6:", ncol(seu_mono), "\n")
+  print(table(seu_mono@meta.data[[col_muestra]]))
+} else {
+  cat("\nConfirmado: muestra HI9_B6 no presente en este objeto (escenario sin_H9 ya aplicado).\n")
+}
+```
+
+***
+
+# Agregacion pseudobulk por muestra
+
+Se colapsan los counts de todas las celulas de monocitos de cada muestra en un unico perfil de expresion por muestra (pseudobulk), sin diferenciar entre subtipos de monocitos. Esto se realiza con `AggregateExpression()` de Seurat, sumando los counts crudos por muestra (`group.by = "orig.ident"`).
+
+```{r aggregate}
+# AggregateExpression suma los counts crudos (raw) por el factor indicado.
+# NOTA: no se especifica el argumento "layer" porque en algunas versiones de
+# Seurat v5 provoca un error de "concuerda con multiples argumentos" por
+# match parcial interno. AggregateExpression() usa "counts" por defecto.
+pseudobulk_agg <- AggregateExpression(
+  seu_mono,
+  assays   = "RNA",
+  group.by = col_muestra,
+  return.seurat = FALSE
+)
+
+# Matriz de counts agregados: genes x muestras
+counts_pseudobulk <- pseudobulk_agg$RNA
+cat("Dimensiones de la matriz pseudobulk (genes x muestras):", dim(counts_pseudobulk), "\n")
+head(counts_pseudobulk[, 1:min(5, ncol(counts_pseudobulk))])
+```
+
+```{r coldata}
+# Construir la tabla de metadatos por muestra (coldata) para DESeq2
+# Se extrae la condicion (grupo) asociada a cada muestra desde el objeto original
+metadata_muestras <- seu_mono@meta.data %>%
+  select(all_of(c(col_muestra, col_condicion))) %>%
+  distinct() %>%
+  as.data.frame()
+colnames(counts_pseudobulk) <- gsub("-", "_", colnames(counts_pseudobulk))
+rownames(metadata_muestras) <- metadata_muestras[[col_muestra]]
+
+# Reordenar coldata para que coincida exactamente con las columnas de la matriz
+metadata_muestras <- metadata_muestras[colnames(counts_pseudobulk), , drop = FALSE]
+
+cat("Metadatos por muestra:\n")
+print(metadata_muestras)
+
+# Comprobacion de orden
+stopifnot(all(rownames(metadata_muestras) == colnames(counts_pseudobulk)))
+```
+
+***
+
+# Analisis con DESeq2
+
+```{r deseq2_object}
+counts_pseudobulk <- round(counts_pseudobulk)
+# Convertimos el objeto S4 a una matriz estándar de R
+counts_pseudobulk <- as.matrix(counts_pseudobulk)
+
+# Comprobamos que ahora sí es una matriz normal y corriente
+print(class(counts_pseudobulk))
+storage.mode(counts_pseudobulk) <- "integer"
+
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_pseudobulk,
+  colData   = metadata_muestras,
+  design    = as.formula(paste0("~ ", col_condicion))
+)
+
+# Filtrado minimo: eliminar genes sin expresion en ninguna muestra
+dds <- dds[rowSums(counts(dds)) > 0, ]
+cat("Genes tras filtrado minimo (expresion > 0 en al menos 1 muestra):", nrow(dds), "\n")
+
+dds <- DESeq(dds)
+```
+
+```{r vst_transform}
+# Transformacion estabilizadora de varianza (vst), apropiada para heatmap y PCA
+# blind = TRUE: la transformacion no usa el diseno experimental (recomendado para
+# visualizacion exploratoria no sesgada por la hipotesis de interes)
+vsd <- vst(dds, blind = TRUE)
+```
+
+***
+
+# Heatmap entre muestras
+
+El heatmap muestra la distancia euclidiana entre los perfiles de expresion (transformados con vst) de cada muestra. Muestras con perfiles transcripcionales similares (menor distancia) se agrupan juntas en el clustering jerarquico. Esto permite evaluar si las muestras se agrupan por condicion (HIE vs control) o si existen otros factores (tecnicos o biologicos) que dominan la variabilidad.
+
+```{r heatmap_distancias, fig.height=6, fig.width=7}
+sample_dists <- dist(t(assay(vsd)))
+sample_dist_matrix <- as.matrix(sample_dists)
+
+rownames(sample_dist_matrix) <- paste(metadata_muestras[[col_muestra]],
+                                      metadata_muestras[[col_condicion]], sep = " - ")
+colnames(sample_dist_matrix) <- rownames(sample_dist_matrix)
+
+colores <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+
+heatmap_muestras_monocitos <- pheatmap(
+  sample_dist_matrix,
+  cluster_rows = FALSE,  
+  cluster_cols = FALSE,  
+  col = colores
+)
+
+heatmap_muestras_monocitos <- pheatmap(
+  sample_dist_matrix,
+  cluster_rows = FALSE,  
+  cluster_cols = FALSE,  
+  col = colores,
+  filename = "C:/Users/celia/Escritorio/TFM/workspace/output/7_pseudobulk/images/heatmap_muestras_monocitos.jpg",
+  width = 7,
+  height = 6
+)
+```
+
+
+Adicionalmente, se incluye un heatmap de correlacion (en lugar de distancia) como visualizacion complementaria, util cuando se quiere enfatizar la similitud relativa entre perfiles mas que la magnitud absoluta de la diferencia.
+
+```{r heatmap_correlacion, fig.height=6, fig.width=7}
+sample_cor_matrix <- cor(assay(vsd), method = "pearson")
+rownames(sample_cor_matrix) <- paste(metadata_muestras[[col_muestra]],
+                                      metadata_muestras[[col_condicion]], sep = " - ")
+colnames(sample_cor_matrix) <- rownames(sample_cor_matrix)
+
+pheatmap(
+  sample_cor_matrix,
+  col = colorRampPalette(brewer.pal(9, "YlOrRd"))(255)
+)
+
+pheatmap(
+  sample_cor_matrix,
+  col = colorRampPalette(brewer.pal(9, "YlOrRd"))(255),
+  filename = "C:/Users/celia/Escritorio/TFM/workspace/output/7_pseudobulk/images/heatmap_muestras_monocitos_correlacion.jpg",
+  width = 7,
+  height = 6
+)
+```
+
+***
+
+# PCA entre muestras
+
+El PCA sobre los perfiles pseudobulk transformados (vst) permite visualizar si las muestras se separan segun la condicion clinica (HIE vs control) cuando se colapsa toda la heterogeneidad de subtipos de monocitos en un unico perfil por muestra.
+
+```{r pca_pseudobulk, fig.height=6, fig.width=8}
+# 1. Generar el gráfico del PCA con ejes y leyenda en inglés
+p_pca <- ggplot(pca_data, aes(x = PC1, y = PC2, color = .data[[col_condicion]])) +
+  geom_point(size = 4) +
+  ggrepel::geom_text_repel(aes(label = .data[[col_muestra]]), size = 3.5, show.legend = FALSE) +
+  xlab(paste0("PC1: ", percent_var[1], "% variance")) +
+  ylab(paste0("PC2: ", percent_var[2], "% variance")) +
+  labs(color = "Condition") + # Pone el título de la leyenda en inglés
+  theme_bw()
+
+# 2. Imprimirlo en pantalla
+print(p_pca)
+
+# 3. Guardarlo con ggsave
+ggsave(
+  filename = "C:/Users/celia/Escritorio/TFM/workspace/output/7_pseudobulk/images/pca_muestras_monocitos.png",
+  plot = p_pca,
+  width = 7,
+  height = 5.5,
+  dpi = 300
+)
+```
+
+
+La proximidad de las muestras en el espacio PCA refleja la similitud global de su perfil transcripcional de monocitos. Si las muestras HIE y control se separan claramente a lo largo de PC1 o PC2, esto sugiere una senal transcripcional de condicion detectable incluso a nivel de pseudobulk (sin resolucion de subtipo). Si no se observa separacion clara, puede deberse a heterogeneidad individual, tamano muestral reducido, o a que la senal diferencial reside principalmente en subpoblaciones especificas de monocitos y se diluye al agregarlas todas juntas.
+
+***
+
+# Exportacion de resultados
+
+```{r export}
+library(writexl)
+
+# 1. Matriz de counts pseudobulk (cruda)
+counts_export <- as.data.frame(counts_pseudobulk)
+counts_export <- cbind(Gene = rownames(counts_export), counts_export)
+
+write_xlsx(counts_export,
+           path = paste0(ruta_excel, "pseudobulk_monocitos_counts_sinH9.xlsx"))
+
+# 2. Matriz vst (normalizada/transformada), útil para análisis posteriores
+vst_export <- as.data.frame(assay(vsd))
+vst_export <- cbind(Gene = rownames(vst_export), vst_export)
+
+write_xlsx(vst_export,
+           path = paste0(ruta_excel, "pseudobulk_monocitos_vst_sinH9.xlsx"))
+
+cat("Archivos Excel exportados con éxito en:", ruta_excel, "\n")
+```
+
+```{r session_info}
+sessionInfo()
+```
